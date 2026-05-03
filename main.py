@@ -97,6 +97,28 @@ config = Config.load(PREFS_FILE)
 
 
 @dataclass
+class AudioClip:
+    """A NiceGUI <audio> element + the volume offset to apply to it.
+
+    `volume_offset` is in percentage points (signed). It's added to the
+    "Effects volume %" slider value and the result is clamped to
+    [0, 100] before being pushed to the underlying <audio> element.
+    Lets quieter clips (gavel.wav) match the perceived loudness of the
+    others without retouching the audio file.
+
+    Construction creates the <audio> as a child of whichever NiceGUI
+    container is currently open — call from inside a `with column:`
+    block, same constraint as a bare `ui.audio(...)`.
+    """
+    path: str
+    volume_offset: int = 0
+    element: ui.audio = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.element = ui.audio(self.path).props("preload=auto").style("display: none")
+
+
+@dataclass
 class AppState:
     """Ephemeral runtime state. Persistent preferences live on `config`."""
     controller: control.HueController | None = None
@@ -236,33 +258,36 @@ def home() -> None:
         if dark_mode.value:
             dark_btn.props("icon=light_mode")
 
-        thunder_audio = ui.audio("/sounds/thunder.wav").props("preload=auto").style("display: none")
-        gong_audio = ui.audio("/sounds/gong.wav").props("preload=auto").style("display: none")
-        gavel_audio = ui.audio("/sounds/gavel.wav").props("preload=auto").style("display: none")
-        rooster_audio = ui.audio("/sounds/rooster.wav").props("preload=auto").style("display: none")
-        good_victory_audio = ui.audio("/sounds/good_victory.wav").props("preload=auto").style("display: none")
-        evil_victory_audio = ui.audio("/sounds/evil_victory.wav").props("preload=auto").style("display: none")
-        click_audio = ui.audio("/sounds/click.wav").props("preload=auto").style("display: none")
+        thunder_audio = AudioClip("/sounds/thunder.wav")
+        gong_audio = AudioClip("/sounds/gong.wav")
+        # Gavel.wav was recorded markedly quieter than the other clips; +30 brings
+        # the bang in line without retouching the audio file (which already peaks
+        # at full scale, so amplitude-boosting it would clip the transient).
+        gavel_audio = AudioClip("/sounds/gavel.wav", volume_offset=30)
+        rooster_audio = AudioClip("/sounds/rooster.wav")
+        good_victory_audio = AudioClip("/sounds/good_victory.wav")
+        evil_victory_audio = AudioClip("/sounds/evil_victory.wav")
+        click_audio = AudioClip("/sounds/click.wav")
         all_audio = (
             thunder_audio, gong_audio, gavel_audio, rooster_audio,
             good_victory_audio, evil_victory_audio,
         )
 
-        async def run_effect(coro_factory, audio_el=None, volume_choreography=None) -> None:
+        async def run_effect(coro_factory, audio_clip: AudioClip | None = None, volume_choreography=None) -> None:
             t_click = time.monotonic()
             name = coro_factory.__name__
             logger.info("[%s] run_effect start", name)
             await stop_effect()
             for a in all_audio:
-                a.pause()
-                a.seek(0)
+                a.element.pause()
+                a.element.seek(0)
             if state.controller is None:
                 logger.info("[%s] aborting: no controller", name)
                 return
             if state.manual_override_active:
                 logger.info("[%s] aborting: manual override active", name)
                 return
-            if audio_el is not None:
+            if audio_clip is not None:
                 # Probe outputLatency only when there's no calibrated override.
                 if config.audio_latency_override_s is None:
                     t_pre_detect = time.monotonic()
@@ -294,7 +319,7 @@ def home() -> None:
                 )
                 if audio_lead > 0:
                     await asyncio.sleep(audio_lead)
-                audio_el.play()
+                audio_clip.element.play()
                 logger.info(
                     "[%s] audio.play() dispatched at +%.0fms",
                     name, (time.monotonic() - t_click) * 1000,
@@ -364,8 +389,8 @@ def home() -> None:
         async def on_stop() -> None:
             await stop_effect()
             for a in all_audio:
-                a.pause()
-                a.seek(0)
+                a.element.pause()
+                a.element.seek(0)
             set_lights(0, 0, 0)
 
         # ╭─ buttons grid (2 columns) ────────────────────────────────╮
@@ -598,9 +623,7 @@ def home() -> None:
                 on_click=lambda: start_calibration("light"),
             ).props("size=sm color=primary")
 
-        click_audio = (
-            ui.audio("/sounds/click.wav").props("preload=auto").style("display: none")
-        )
+        click_audio = AudioClip("/sounds/click.wav")
 
         def _audio_override_changed(_e) -> None:
             v = audio_override_input.value
@@ -709,8 +732,8 @@ def home() -> None:
             if mode == "audio":
                 # HTML5 <audio> won't replay a finished clip without seeking
                 # to the start first.
-                click_audio.seek(0)
-                click_audio.play()
+                click_audio.element.seek(0)
+                click_audio.element.play()
             elif mode == "light":
                 if state.controller is not None:
                     state.controller.set_color(255, 255, 255)
@@ -890,12 +913,14 @@ def home() -> None:
         ).props("label-always")
 
         def _push_audio_vol(persist: bool = True) -> None:
-            v = audio_vol_slider.value / 100
-            for au in (*all_audio, click_audio):
+            v_pct = int(audio_vol_slider.value)  # 0..100
+            for clip in (*all_audio, click_audio):
+                clip_vol = max(0, min(100, v_pct + clip.volume_offset)) / 100
                 ui.run_javascript(
-                    f'const el = document.getElementById("c{au.id}");'
-                    f' if (el) el.volume = {v};'
+                    f'const el = document.getElementById("c{clip.element.id}");'
+                    f' if (el) el.volume = {clip_vol};'
                 )
+            v = v_pct / 100
             if persist:
                 config.update(internal_audio_volume=v)
             else:
@@ -904,10 +929,10 @@ def home() -> None:
         audio_vol_slider.on("change", lambda _e: _push_audio_vol())
 
         with ui.row().classes("gap-1 flex-wrap mt-1"):
-            ui.button("Thunder", on_click=thunder_audio.play).props("size=sm flat")
-            ui.button("Gong", on_click=gong_audio.play).props("size=sm flat")
-            ui.button("Gavel", on_click=gavel_audio.play).props("size=sm flat")
-            ui.button("Rooster", on_click=rooster_audio.play).props("size=sm flat")
+            ui.button("Thunder", on_click=thunder_audio.element.play).props("size=sm flat")
+            ui.button("Gong", on_click=gong_audio.element.play).props("size=sm flat")
+            ui.button("Gavel", on_click=gavel_audio.element.play).props("size=sm flat")
+            ui.button("Rooster", on_click=rooster_audio.element.play).props("size=sm flat")
 
       # ╭────────────────────── LOG VIEWER ────────────────────────────╮
       # Visible only when state.expanded_mode is True.
