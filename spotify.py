@@ -141,11 +141,15 @@ async def gavel_volume(spotify: SpotifyController, prev_vol: int) -> None:
         await spotify.set_volume(prev_vol)
 
 
-async def morning_volume(spotify: SpotifyController, prev_vol: int) -> None:
-    """Day setpoint: fade to 50% over 1s. No auto-restore."""
-    await _stepped_fade(spotify, prev_vol, 50, duration=1.0, steps=10)
+async def morning_volume(
+    spotify: SpotifyController, prev_vol: int, *, target: int = 50
+) -> None:
+    """Day setpoint: fade to `target`% over 1s. No auto-restore."""
+    await _stepped_fade(spotify, prev_vol, target, duration=1.0, steps=10)
 
 
-async def night_volume(spotify: SpotifyController, prev_vol: int) -> None:
-    """Night setpoint: fade to 100% over 1s. No auto-restore."""
-    await _stepped_fade(spotify, prev_vol, 100, duration=1.0, steps=10)
+async def night_volume(
+    spotify: SpotifyController, prev_vol: int, *, target: int = 100
+) -> None:
+    """Night setpoint: fade to `target`% over 1s. No auto-restore."""
+    await _stepped_fade(spotify, prev_vol, target, duration=1.0, steps=10)

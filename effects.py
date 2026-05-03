@@ -128,8 +128,20 @@ def _envelope_at(rms: np.ndarray, hop_seconds: float, t: float) -> float:
 FRAME = 1 / 60
 
 # Shared "settled" end state for every effect except Night. Soft warm white,
-# roughly 100% brightness on a daylight-leaning bulb.
+# roughly 100% brightness on a daylight-leaning bulb. Mutable at runtime via
+# `set_bright_white(...)` — the dashboard's config panel updates it live.
 BRIGHT_WHITE: tuple[int, int, int] = (244, 218, 182)
+
+
+def set_bright_white(r: int, g: int, b: int) -> None:
+    """Update the BRIGHT_WHITE constant. Effects look it up by name on every
+    frame, so the new value takes effect on the next iteration."""
+    global BRIGHT_WHITE
+    BRIGHT_WHITE = (
+        max(0, min(255, int(r))),
+        max(0, min(255, int(g))),
+        max(0, min(255, int(b))),
+    )
 
 
 def _resolve_clock(clock: ClockLike | None) -> ClockLike:
@@ -199,31 +211,47 @@ async def gavel_effect(ctl: LightController, *, clock: ClockLike | None = None) 
     ctl.set_color(*BRIGHT_WHITE)
 
 
-async def _lightning_with_strikes(
-    ctl: LightController,
-    strikes: list[float],
-    *,
-    clock: ClockLike | None = None,
+async def lightning_effect(
+    ctl: LightController, *, clock: ClockLike | None = None
 ) -> None:
-    """Generic lightning effect: dim purple/blue ambient with a max-white
-    ultra-flash at each strike time. After the audio, settles to BRIGHT_WHITE.
+    """Lightning with per-channel ambient + RMS-driven quiver.
 
-    The three named lightning_* variants below differ only in which strike
-    times they pass — so you can A/B/C the three spectroscopy methods.
-    """
+    Between strikes each channel shows its own shade of blue/purple, with
+    brightness pulsing subtly with the audio's RMS envelope (quiet rumble
+    → ~85% of base; loud rumble → ~115%). At each strike time, all 3
+    channels flash max-white, then ease back down to their (still
+    quivering) base color. After the audio, settles to BRIGHT_WHITE.
+
+    Strike times are from peak waveform amplitude analysis of thunder.wav."""
     clock = _resolve_clock(clock)
     a = get_thunder()
 
-    AMBIENT = (20, 10, 70)
+    BASE_COLORS = [
+        (10, 30, 110),    # ch0: deep blue
+        (40, 15, 120),    # ch1: indigo
+        (80, 20, 110),    # ch2: violet
+    ]
     WHITE = (255, 255, 255)
-    FLASH_DUR = 0.08    # full white hold
-    FADE_DUR = 0.30     # ease back down to AMBIENT
+    STRIKES = [0.300, 0.900]
+
+    FLASH_DUR = 0.08
+    FADE_DUR = 0.30
     SETTLE_DUR = 2.0
 
     settle_start = a.duration
     duration = settle_start + SETTLE_DUR
 
-    sorted_strikes = sorted(strikes)
+    def quiver_factor(t: float) -> float:
+        # 0.85 → 1.15 driven by RMS. ^0.5 lifts quiet rumbles so they're
+        # still visible as gentle pulsing rather than dead-flat.
+        env = _envelope_at(a.rms, a.rms_hop_seconds, t)
+        return 0.85 + 0.30 * (env ** 0.5)
+
+    def base_snapshot(t: float) -> list[tuple[int, int, int]]:
+        f = quiver_factor(t)
+        return [_scale(c, f) for c in BASE_COLORS]
+
+    last_snapshot: tuple[tuple[int, int, int], ...] = tuple(BASE_COLORS)
 
     start = clock.now()
     while True:
@@ -232,56 +260,31 @@ async def _lightning_with_strikes(
             break
 
         if t < settle_start:
+            base = base_snapshot(t)
             recent = None
-            for s_t in sorted_strikes:
+            for s_t in STRIKES:
                 if s_t > t:
                     break
                 recent = s_t
-            if recent is None:
-                color = AMBIENT
-            else:
+            if recent is not None and t - recent < FLASH_DUR + FADE_DUR:
                 d = t - recent
                 if d < FLASH_DUR:
-                    color = WHITE
-                elif d < FLASH_DUR + FADE_DUR:
-                    f = (d - FLASH_DUR) / FADE_DUR
-                    f = f * f  # ease-in for snappy fall
-                    color = _lerp(WHITE, AMBIENT, f)
+                    snap = [WHITE, WHITE, WHITE]
                 else:
-                    color = AMBIENT
+                    f = (d - FLASH_DUR) / FADE_DUR
+                    f = f * f
+                    snap = [_lerp(WHITE, base[ch], f) for ch in range(3)]
+            else:
+                snap = base
+            last_snapshot = tuple(snap)
         else:
             f = (t - settle_start) / SETTLE_DUR
             f = 0.5 - 0.5 * math.cos(f * math.pi)
-            color = _lerp(AMBIENT, BRIGHT_WHITE, f)
+            snap = [_lerp(last_snapshot[ch], BRIGHT_WHITE, f) for ch in range(3)]
 
-        ctl.set_color(*color)
+        ctl.set_colors(snap)
         await clock.sleep(FRAME)
     ctl.set_color(*BRIGHT_WHITE)
-
-
-async def lightning_onset_effect(
-    ctl: LightController, *, clock: ClockLike | None = None
-) -> None:
-    """Strike times from `librosa.onset.onset_strength` — the original method.
-    Reports the second strike very late at 8.034s, which is likely a false
-    positive (no HF content there)."""
-    await _lightning_with_strikes(ctl, [0.093, 8.034], clock=clock)
-
-
-async def lightning_hf_effect(
-    ctl: LightController, *, clock: ClockLike | None = None
-) -> None:
-    """Strike times from high-frequency-emphasized spectral flux — the most
-    physically appropriate detector for lightning cracks (HF burst)."""
-    await _lightning_with_strikes(ctl, [0.070, 0.627], clock=clock)
-
-
-async def lightning_amp_effect(
-    ctl: LightController, *, clock: ClockLike | None = None
-) -> None:
-    """Strike times from peak waveform amplitude (loudest moments). Tends
-    to land later than the visual strike since sound trails the flash."""
-    await _lightning_with_strikes(ctl, [0.300, 0.900], clock=clock)
 
 
 async def gong_effect(ctl: LightController, *, clock: ClockLike | None = None) -> None:

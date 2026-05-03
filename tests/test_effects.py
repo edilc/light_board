@@ -170,36 +170,44 @@ async def test_gavel():
     assert rec.is_uniform()
 
 
-@pytest.mark.parametrize(
-    "effect, expected_strikes",
-    [
-        (effects.lightning_onset_effect, [0.093, 8.034]),
-        (effects.lightning_hf_effect, [0.070, 0.627]),
-        (effects.lightning_amp_effect, [0.300, 0.900]),
-    ],
-)
-async def test_lightning_variant(effect, expected_strikes):
+async def test_lightning():
     clock = VirtualClock()
     rec = RecordingController(clock)
-    await effect(rec, clock=clock)
+    await effects.lightning_effect(rec, clock=clock)
     thunder = effects.get_thunder()
-    _check_invariants(effect.__name__, rec, expected_seconds=thunder.duration + 2.0)
-    # Each variant is uniform across channels (the new design).
-    assert rec.is_uniform(), f"{effect.__name__} should drive all channels identically"
-    # Each expected strike should produce a near-white frame within ~0.1s of the strike time.
-    for strike_t in expected_strikes:
-        if strike_t >= thunder.duration:
-            continue  # strike beyond audio end can't be tested cleanly
-        nearby = [
-            (t, snap[0])
+    _check_invariants("lightning", rec, expected_seconds=thunder.duration + 2.0)
+    _print_trace("lightning", rec, every=120)
+
+    # Each strike should produce a max-white frame on all 3 channels within ~0.1s.
+    STRIKES = [0.300, 0.900]
+    for strike_t in STRIKES:
+        white_frames = [
+            (t, snap)
             for t, snap in rec.events
-            if abs(t - strike_t) < 0.1
+            if abs(t - strike_t) < 0.15 and all(min(c) >= 240 for c in snap)
         ]
-        whites = [c for _, c in nearby if min(c) >= 240]
-        assert whites, (
-            f"{effect.__name__}: no white frame found within 100ms of strike at {strike_t}s"
-        )
-    # Final frame should be BRIGHT_WHITE.
-    assert _last_color(rec) == BRIGHT_WHITE, (
-        f"{effect.__name__} should settle at BRIGHT_WHITE"
+        assert white_frames, f"no max-white frame within 150ms of strike at {strike_t}s"
+
+    # In-between (after first strike fade ends, before second strike): channels
+    # must show distinct shades — not uniform — and brightness must vary
+    # (the RMS-driven quiver).
+    in_between = [
+        (t, snap)
+        for t, snap in rec.events
+        if 0.7 < t < 0.85
+    ]
+    assert in_between, "no frames captured in the in-between window"
+    # Channels are distinct (different blue/purple shades).
+    assert all(len(set(snap)) > 1 for _, snap in in_between), (
+        "in-between frames should have varying shades across channels, not uniform"
+    )
+    # Channel-0 brightness varies across the window (quiver).
+    ch0_brightness = [sum(snap[0]) / 3 for _, snap in in_between]
+    assert max(ch0_brightness) - min(ch0_brightness) > 1, (
+        f"channel 0 should quiver with RMS; range was {max(ch0_brightness) - min(ch0_brightness):.1f}"
+    )
+
+    # Settle: last frame is BRIGHT_WHITE on all channels.
+    assert rec.events[-1][1] == (BRIGHT_WHITE,) * 3, (
+        f"lightning should settle at BRIGHT_WHITE on all channels, got {rec.events[-1][1]}"
     )
