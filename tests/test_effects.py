@@ -359,6 +359,24 @@ async def test_victory_effect(cfg: Config, name: str, kind: str, tail_start: flo
     )
 
 
+def test_victory_no_consecutive_same_channel():
+    """Channel walk is a Markov chain: each pick is uniform over the two
+    channels that aren't the previous one. Tested directly on the helper
+    rather than recovered from event traces — when fireworks fire close
+    together (e.g. 2.322 → 2.577 in the good clip), the previous
+    channel's mid-fade can outshine the new flash depending on which
+    colors were drawn, making any 'brightest channel near s_t' heuristic
+    unreliable. The invariant lives in the helper, so we test it there."""
+    for _ in range(200):
+        picks = effects._random_firework_picks(8)
+        channels = [ch for ch, _ in picks]
+        for i, (a, b) in enumerate(zip(channels, channels[1:])):
+            assert a != b, (
+                f"firework {i+1} on channel {b} repeats channel {a} "
+                f"from firework {i}; full sequence {channels}"
+            )
+
+
 async def test_victory_picks_random_per_run(cfg: Config):
     """Firework picks (channel + color) must be drawn fresh each run via
     `random` — not fixed at module load. Two runs in a row should produce

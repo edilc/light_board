@@ -428,14 +428,20 @@ def _tail_color(
 def _random_firework_picks(
     n: int,
 ) -> list[tuple[int, tuple[int, int, int]]]:
-    """One (channel, color) per firework, drawn fresh each call. No
-    constraints — channel and color are both fully random, so consecutive
-    pops can land on the same bulb or repeat a color. That's the user's
-    'fully random, decided in the moment' brief."""
-    return [
-        (random.randrange(3), random.choice(FIREWORK_COLORS))
-        for _ in range(n)
-    ]
+    """One (channel, color) per firework, drawn fresh each call. The
+    channel walk is a 3-state Markov chain — each pick is uniform over
+    the two channels that aren't the previous pop, so no bulb fires
+    twice in a row. Color stays fully random across the 9-color palette
+    (consecutive color repeats are allowed and read fine since they land
+    on different bulbs)."""
+    picks: list[tuple[int, tuple[int, int, int]]] = []
+    prev_ch = -1
+    for _ in range(n):
+        candidates = [c for c in (0, 1, 2) if c != prev_ch]
+        ch = random.choice(candidates)
+        picks.append((ch, random.choice(FIREWORK_COLORS)))
+        prev_ch = ch
+    return picks
 
 
 async def _victory_effect(
