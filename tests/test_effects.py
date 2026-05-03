@@ -17,7 +17,8 @@ import asyncio
 import pytest
 
 import effects
-from control import RecordingController, VirtualClock
+from config import Config
+from control import RecordingController, RecordingVolumeController, VirtualClock
 from tests.trace import sparse_table, summarize
 
 
@@ -27,6 +28,12 @@ def _warm_audio_cache():
     use this fixture in async form, so we call the sync getters directly."""
     effects.get_thunder()
     effects.get_gong()
+
+
+@pytest.fixture
+def cfg() -> Config:
+    """A default in-memory Config (no `path`, so save() is a no-op)."""
+    return Config()
 
 
 def _check_invariants(name: str, rec: RecordingController, expected_seconds: float) -> None:
@@ -52,21 +59,19 @@ def _last_color(rec: RecordingController, channel: int = 0):
     return rec.events[-1][1][channel]
 
 
-def _first_color(rec: RecordingController, channel: int = 0):
-    return rec.events[0][1][channel]
+BRIGHT_WHITE = (244, 218, 182)  # matches Config default — kept as a literal here
+                                # so the test's expected value is locked in even
+                                # if the Config default ever drifts.
 
 
-BRIGHT_WHITE = (244, 218, 182)
-
-
-async def test_morning():
-    """Morning is now a 1s lerp from current state to BRIGHT_WHITE.
+async def test_morning(cfg: Config):
+    """Morning is a 1s lerp from current state to BRIGHT_WHITE.
     Pre-seed last_colors to a known non-bright-white state to verify the
     starting-point logic."""
     clock = VirtualClock()
     rec = RecordingController(clock)
     rec.last_colors = ((50, 30, 80), (40, 60, 100), (90, 60, 20))
-    await effects.morning_effect(rec, clock=clock)
+    await effects.morning_effect(rec, cfg, clock=clock)
     _check_invariants("morning", rec, expected_seconds=1.0)
     _print_trace("morning", rec, every=10)
     # First frame should be near the seeded state (smoothstep at f=0 → 0).
@@ -80,7 +85,7 @@ async def test_morning():
     )
 
 
-async def test_night():
+async def test_night(cfg: Config):
     """Night runs forever — phases 1-2 transition into the candle state,
     phase 3 sustains candle flicker until the task is cancelled. The test
     pumps the virtual clock past phase 3 and then cancels."""
@@ -88,7 +93,7 @@ async def test_night():
     rec = RecordingController(clock)
     rec.last_colors = (BRIGHT_WHITE, BRIGHT_WHITE, BRIGHT_WHITE)
 
-    task = asyncio.create_task(effects.night_effect(rec, clock=clock))
+    task = asyncio.create_task(effects.night_effect(rec, cfg, clock=clock))
     # Pump until ~9s of virtual time has elapsed (phase 1+2 = 3s, plus 6s of candle).
     target = 9.0
     safety = int(target * 60 * 3)  # 3x frames as a hang fuse
@@ -134,10 +139,10 @@ async def test_night():
     )
 
 
-async def test_gong():
+async def test_gong(cfg: Config):
     clock = VirtualClock()
     rec = RecordingController(clock)
-    await effects.gong_effect(rec, clock=clock)
+    await effects.gong_effect(rec, cfg, clock=clock)
     gong = effects.get_gong()
     _check_invariants("gong", rec, expected_seconds=gong.duration + 1.5)
     _print_trace("gong", rec, every=40)
@@ -145,10 +150,10 @@ async def test_gong():
     assert rec.is_uniform()
 
 
-async def test_gavel():
+async def test_gavel(cfg: Config):
     clock = VirtualClock()
     rec = RecordingController(clock)
-    await effects.gavel_effect(rec, clock=clock)
+    await effects.gavel_effect(rec, cfg, clock=clock)
     # 1.4s of flash logic + 1.5s settle = ~2.9s
     _check_invariants("gavel", rec, expected_seconds=2.9)
     _print_trace("gavel", rec, every=20)
@@ -170,10 +175,10 @@ async def test_gavel():
     assert rec.is_uniform()
 
 
-async def test_lightning():
+async def test_lightning(cfg: Config):
     clock = VirtualClock()
     rec = RecordingController(clock)
-    await effects.lightning_effect(rec, clock=clock)
+    await effects.lightning_effect(rec, cfg, clock=clock)
     thunder = effects.get_thunder()
     _check_invariants("lightning", rec, expected_seconds=thunder.duration + 2.0)
     _print_trace("lightning", rec, every=120)
@@ -201,13 +206,145 @@ async def test_lightning():
     assert all(len(set(snap)) > 1 for _, snap in in_between), (
         "in-between frames should have varying shades across channels, not uniform"
     )
-    # Channel-0 brightness varies across the window (quiver).
+    # Channel-0 brightness varies across the window (quiver). The amplitude
+    # should be visible — not just int-rounding noise. Quiver factor is
+    # 0.85→1.15 (30% range) on a base average ~50, so we expect ≥5 units of
+    # spread across the ~120-frame window. Older test allowed >1, which
+    # would pass even on a totally broken quiver via quantization noise.
     ch0_brightness = [sum(snap[0]) / 3 for _, snap in in_between]
-    assert max(ch0_brightness) - min(ch0_brightness) > 1, (
-        f"channel 0 should quiver with RMS; range was {max(ch0_brightness) - min(ch0_brightness):.1f}"
+    spread = max(ch0_brightness) - min(ch0_brightness)
+    assert spread > 5, (
+        f"channel 0 should quiver with RMS; range was {spread:.1f}, expected >5"
     )
 
     # Settle: last frame is BRIGHT_WHITE on all channels.
     assert rec.events[-1][1] == (BRIGHT_WHITE,) * 3, (
         f"lightning should settle at BRIGHT_WHITE on all channels, got {rec.events[-1][1]}"
     )
+
+
+async def test_bright_white_live_update():
+    """Effects must read `config.bright_white` on every frame, not capture
+    it once at function start. The dashboard's "Save as Day target"
+    mutates the config in place — a regression to capturing-at-start
+    would silently break that flow.
+
+    We probe this by changing config.bright_white *mid-effect* and
+    asserting the final frame reflects the new value. A capture-at-start
+    regression would fail this even though it'd pass a "set before, run,
+    check final" style of test."""
+    cfg = Config(bright_white=(50, 50, 50))
+    clock = VirtualClock()
+    rec = RecordingController(clock)
+    rec.last_colors = ((10, 10, 10),) * 3
+
+    task = asyncio.create_task(effects.morning_effect(rec, cfg, clock=clock))
+    # Pump until ~halfway through morning (1.0s total).
+    target_t = 0.5
+    safety = int(target_t * 60 * 3)
+    i = 0
+    while clock.now() < target_t and not task.done() and i < safety:
+        await asyncio.sleep(0)
+        i += 1
+    # Mutate the config *while the effect is running*.
+    cfg.bright_white = (200, 220, 240)
+    await task
+
+    assert rec.events[-1][1] == ((200, 220, 240),) * 3, (
+        f"morning should land on the *later* config.bright_white, "
+        f"got {rec.events[-1][1]} (pre-change value was 50,50,50)"
+    )
+
+
+async def test_night_cancellation_preserves_state(cfg: Config):
+    """Effects do NOT zero the lights on cancel — that lets the next effect
+    (typically morning) lerp continuously from the prior state. If an
+    effect adds a `finally: ctl.set_color(0,0,0)` it would break that
+    contract silently."""
+    clock = VirtualClock()
+    rec = RecordingController(clock)
+    rec.last_colors = (BRIGHT_WHITE,) * 3
+
+    task = asyncio.create_task(effects.night_effect(rec, cfg, clock=clock))
+    target = 4.0  # past phase 1+2, well into the candle sustain
+    safety = int(target * 60 * 3)
+    iterations = 0
+    while clock.now() < target and not task.done() and iterations < safety:
+        await asyncio.sleep(0)
+        iterations += 1
+    last_before_cancel = rec.last_colors
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert rec.last_colors == last_before_cancel, (
+        "controller state must not change after cancellation — "
+        f"was {last_before_cancel}, became {rec.last_colors}"
+    )
+    assert rec.last_colors != ((0, 0, 0),) * 3, (
+        "night must NOT zero on cancel — Morning relies on lerping from prior color"
+    )
+    assert rec.last_colors != (BRIGHT_WHITE,) * 3, (
+        "night should have moved last_colors away from the seeded BRIGHT_WHITE by t=4s"
+    )
+
+
+async def test_night_drives_volume_synced_with_lights(cfg: Config):
+    """If `night_effect` is given a VolumeController + prev_volume, it must
+    fade the volume from prev_volume to `config.night_target_volume` while
+    the lights settle into the candle state — not as an external task."""
+    cfg.night_target_volume = 80
+    clock = VirtualClock()
+    rec = RecordingController(clock)
+    vol = RecordingVolumeController(clock)
+
+    task = asyncio.create_task(
+        effects.night_effect(rec, cfg, spotify=vol, prev_volume=20, clock=clock)
+    )
+    # Let the effect run well past the phase 1+2 transition (3s).
+    target_t = 8.0
+    safety = int(target_t * 60 * 3)
+    i = 0
+    while clock.now() < target_t and not task.done() and i < safety:
+        await asyncio.sleep(0)
+        i += 1
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert vol.events, "night_effect must emit volume events when given a controller"
+    volumes = [v for _, v in vol.events]
+    # First volume should be between start and target (a fade step), and
+    # the last should hit the target.
+    assert 20 < volumes[0] <= 80, f"first step {volumes[0]} should be a fade step between 20 and 80"
+    assert volumes[-1] == 80, f"final volume should hit night_target_volume=80, got {volumes[-1]}"
+    # Fade is monotonic upward toward target.
+    assert volumes == sorted(volumes), f"volume fade should be monotonic; got {volumes}"
+
+
+async def test_night_volume_skipped_without_spotify(cfg: Config):
+    """When `spotify` or `prev_volume` is None, night_effect must not
+    attempt any volume work — used by tests that don't care about audio,
+    and as a defensive fallback if SpotifyController isn't available."""
+    clock = VirtualClock()
+    rec = RecordingController(clock)
+    # No spotify → no volume task spawned, no exception.
+    task = asyncio.create_task(effects.night_effect(rec, cfg, clock=clock))
+    safety = 60 * 3 * 3  # ~3s of frames
+    i = 0
+    while clock.now() < 3.5 and not task.done() and i < safety:
+        await asyncio.sleep(0)
+        i += 1
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    # If we got here without an exception and produced light events, OK.
+    assert rec.events, "lights still drive when spotify is omitted"
+
+

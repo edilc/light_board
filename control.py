@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Protocol, Sequence, runtime_checkable
+from collections.abc import Sequence
+from typing import Protocol, runtime_checkable
 
 from hue_entertainment_pykit import (
     Discovery,
@@ -19,7 +20,6 @@ from hue_entertainment_pykit import (
     Streaming,
 )
 from hue_entertainment_pykit.models.bridge import Bridge
-
 
 Color = tuple[int, int, int]
 Snapshot = tuple[Color, ...]
@@ -39,6 +39,17 @@ class LightController(Protocol):
 
     def set_color(self, r: int, g: int, b: int) -> None: ...
     def set_colors(self, colors: Sequence[Color]) -> None: ...
+
+
+@runtime_checkable
+class VolumeController(Protocol):
+    """Anything that can accept media-volume commands. Effects use this to
+    choreograph music volume alongside lights — `night_effect` fades the
+    volume up to the night setpoint over the same window the lights
+    transition into the candle state. `SpotifyController` satisfies this;
+    tests use `RecordingVolumeController`."""
+
+    async def set_volume(self, percent: int) -> None: ...
 
 
 class Clock:
@@ -64,6 +75,9 @@ class VirtualClock:
     async def sleep(self, seconds: float) -> None:
         self._t += seconds
         await asyncio.sleep(0)
+
+
+ClockLike = Clock | VirtualClock
 
 
 class HueController:
@@ -138,6 +152,19 @@ class RecordingController:
     def is_uniform(self) -> bool:
         """True if every recorded snapshot has the same color across channels."""
         return all(len(set(snap)) == 1 for _, snap in self.events)
+
+
+class RecordingVolumeController:
+    """Captures every `set_volume(percent)` call as `(t, percent)`. Drives
+    `t` from an injected clock so volume traces line up with light traces
+    when both are recorded in the same test."""
+
+    def __init__(self, clock: Clock | VirtualClock) -> None:
+        self._clock = clock
+        self.events: list[tuple[float, int]] = []
+
+    async def set_volume(self, percent: int) -> None:
+        self.events.append((self._clock.now(), int(percent)))
 
 
 def connect() -> HueController:

@@ -17,8 +17,32 @@ hue-entertainment-pykit = { path = "../hue-entertainment-pykit", editable = true
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
+    "ruff>=0.15.12",
+    "ty>=0.0.34",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# Underscore-prefixed root scripts are one-shot exploratory tools (e.g.
+# `_victory_analysis.py`) — kept around but not maintained to lint-clean.
+extend-exclude = ["_*.py"]
+
+[tool.ruff.lint]
+# E,F = pyflakes/pycodestyle (default); I = import sorting; UP = pyupgrade
+select = ["E", "F", "I", "UP"]
+# E501 (line length) is enforced by formatter, not lint, so we don't need it here.
+# E741 lets us keep `l` as a loop var if needed.
+ignore = ["E501", "E741"]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.rules]
+# WindowProxy is a dynamic forwarder to pywebview; many of its real
+# attributes aren't declared. Suppressed inline where used.
+unresolved-attribute = "warn"

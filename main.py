@@ -1,20 +1,19 @@
 import asyncio
+import inspect
 import logging
 import time
 from dataclasses import dataclass, field
-from statistics import mean as _mean, stdev
 from pathlib import Path
-from typing import Optional
-
-from nicegui import app, background_tasks, ui
+from statistics import mean as _mean
+from statistics import stdev
 
 from hue_entertainment_pykit import setup_logs
+from nicegui import app, background_tasks, ui
 
 import control
 import effects
-import prefs
 import spotify as spotify_mod
-
+from config import Config
 
 # Write app logs to logs/light_board.log AND stderr. Run with `uv run main.py`
 # as before — the file gets appended to automatically.
@@ -90,25 +89,26 @@ document.addEventListener('keydown', (e) => {
 # lights land at the user roughly together.
 HUE_LATENCY_S = 0.050
 
+# Persistent user prefs. One source of truth — `config.update(field=value)`
+# mutates the field and writes the JSON atomically. Effects read live
+# fields (e.g. `config.bright_white`) every frame.
+PREFS_FILE = Path(__file__).parent / "data" / "preferences.json"
+config = Config.load(PREFS_FILE)
+
 
 @dataclass
 class AppState:
-    controller: Optional[control.HueController] = None
-    effect_task: Optional[asyncio.Task] = None
-    audio_latency_s: float = 0.0  # browser-reported output latency
-    spotify: spotify_mod.SpotifyController = None  # type: ignore[assignment]
+    """Ephemeral runtime state. Persistent preferences live on `config`."""
+    controller: control.HueController | None = None
+    effect_task: asyncio.Task | None = None
+    audio_latency_s: float = 0.0  # browser-reported output latency (auto-detected)
+    spotify: spotify_mod.SpotifyController = field(
+        default_factory=spotify_mod.SpotifyController
+    )
     last_volume: int = 50
-    volume_task: Optional[asyncio.Task] = None
+    volume_task: asyncio.Task | None = None
     # Manual color override (config panel)
     manual_override_active: bool = False
-    # Latency overrides (None = use auto-detected / constant); seconds
-    audio_latency_override_s: Optional[float] = None
-    hue_latency_override_s: Optional[float] = None
-    # Spotify volume targets for morning/night (defaults match plan)
-    morning_target_volume: int = 50
-    night_target_volume: int = 100
-    # 0.0-1.0; applied to all <audio> elements via JS
-    internal_audio_volume: float = 1.0
     # Cursor into logs/light_board.log for the live tail viewer
     log_offset: int = 0
     # Toggle for the expanded UI (config panel + log viewer). Tailwind
@@ -118,52 +118,14 @@ class AppState:
     # Spacebar-tap calibration runtime state. `mode` is "audio" or "light"
     # while a calibration session is active (None otherwise). `taps` is a
     # rolling window of the last 5 tap-time-minus-beat-time offsets.
-    calibration_mode: Optional[str] = None
+    calibration_mode: str | None = None
     calibration_taps: list = field(default_factory=list)
     calibration_beat_t: float = 0.0
     calibration_beat_count: int = 0
-    calibration_pending: Optional[tuple] = None  # (mode, mean_seconds) when locked in
+    calibration_pending: tuple | None = None  # (mode, mean_seconds) when locked in
 
 
 state = AppState()
-state.spotify = spotify_mod.SpotifyController()
-
-# ── Load persisted preferences and apply to state + effects ──────────
-_loaded_prefs = prefs.load()
-state.morning_target_volume = int(_loaded_prefs["morning_target_volume"])
-state.night_target_volume = int(_loaded_prefs["night_target_volume"])
-state.internal_audio_volume = float(_loaded_prefs["internal_audio_volume"])
-_bw = _loaded_prefs["bright_white"]
-effects.set_bright_white(_bw[0], _bw[1], _bw[2])
-_audio_ms = _loaded_prefs.get("audio_latency_override_ms")
-_hue_ms = _loaded_prefs.get("hue_latency_override_ms")
-state.audio_latency_override_s = (_audio_ms / 1000) if _audio_ms is not None else None
-state.hue_latency_override_s = (_hue_ms / 1000) if _hue_ms is not None else None
-
-
-def save_prefs() -> None:
-    """Persist current settings. Called from change handlers."""
-    prefs.save({
-        "bright_white": list(effects.BRIGHT_WHITE),
-        "morning_target_volume": state.morning_target_volume,
-        "night_target_volume": state.night_target_volume,
-        "internal_audio_volume": state.internal_audio_volume,
-        "dark_mode": _loaded_prefs.get("dark_mode", False),
-        "audio_latency_override_ms": (
-            state.audio_latency_override_s * 1000
-            if state.audio_latency_override_s is not None else None
-        ),
-        "hue_latency_override_ms": (
-            state.hue_latency_override_s * 1000
-            if state.hue_latency_override_s is not None else None
-        ),
-    })
-
-
-def save_prefs_with_dark(dark: bool) -> None:
-    """Update the dark-mode preference and save. Called from the toggle."""
-    _loaded_prefs["dark_mode"] = bool(dark)
-    save_prefs()
 
 
 def _ensure_click_wav() -> None:
@@ -255,7 +217,7 @@ def home() -> None:
        )
        with controls_col:
         # Dark mode element (no UI of its own — driven by the header button).
-        dark_mode = ui.dark_mode(value=bool(_loaded_prefs.get("dark_mode", False)))
+        dark_mode = ui.dark_mode(value=config.dark_mode)
 
         with ui.row().classes("w-full items-center gap-1 -mb-1"):
             status = ui.label("Connecting…").classes("text-xs text-gray-500 flex-1")
@@ -266,7 +228,7 @@ def home() -> None:
 
         def toggle_dark() -> None:
             dark_mode.toggle()
-            save_prefs_with_dark(bool(dark_mode.value))
+            config.update(dark_mode=bool(dark_mode.value))
             dark_btn.props(f'icon={"light_mode" if dark_mode.value else "dark_mode"}')
 
         dark_btn.on_click(toggle_dark)
@@ -297,7 +259,7 @@ def home() -> None:
                 return
             if audio_el is not None:
                 # Probe outputLatency only when there's no calibrated override.
-                if state.audio_latency_override_s is None:
+                if config.audio_latency_override_s is None:
                     t_pre_detect = time.monotonic()
                     try:
                         state.audio_latency_s = await detect_audio_latency()
@@ -309,13 +271,13 @@ def home() -> None:
                     except Exception as exc:
                         logger.warning("[%s] latency probe failed: %s", name, exc)
                 audio_lat = (
-                    state.audio_latency_override_s
-                    if state.audio_latency_override_s is not None
+                    config.audio_latency_override_s
+                    if config.audio_latency_override_s is not None
                     else state.audio_latency_s
                 )
                 hue_lat = (
-                    state.hue_latency_override_s
-                    if state.hue_latency_override_s is not None
+                    config.hue_latency_override_s
+                    if config.hue_latency_override_s is not None
                     else HUE_LATENCY_S
                 )
                 # Delay whichever side is faster so both arrive together.
@@ -334,7 +296,19 @@ def home() -> None:
                 )
                 if light_lead > 0:
                     await asyncio.sleep(light_lead)
-            state.effect_task = asyncio.create_task(coro_factory(state.controller))
+            # Effects that drive volume internally (currently just `night_effect`)
+            # accept `spotify` and `prev_volume` kwargs. Detected by signature.
+            effect_kwargs: dict = {}
+            if "spotify" in inspect.signature(coro_factory).parameters:
+                effect_kwargs["spotify"] = state.spotify
+                effect_kwargs["prev_volume"] = state.last_volume
+                logger.info(
+                    "[%s] driving volume internally (prev_vol=%d → target)",
+                    name, state.last_volume,
+                )
+            state.effect_task = asyncio.create_task(
+                coro_factory(state.controller, config, **effect_kwargs)
+            )
             logger.info(
                 "[%s] light task created at +%.0fms after click",
                 name, (time.monotonic() - t_click) * 1000,
@@ -360,22 +334,21 @@ def home() -> None:
             await run_effect(
                 effects.morning_effect,
                 rooster_audio,
-                lambda s, p: spotify_mod.morning_volume(s, p, target=state.morning_target_volume),
+                lambda s, p: spotify_mod.morning_volume(s, p, target=config.morning_target_volume),
             )
 
         async def on_morning() -> None:
             await run_effect(
                 effects.morning_effect,
                 None,
-                lambda s, p: spotify_mod.morning_volume(s, p, target=state.morning_target_volume),
+                lambda s, p: spotify_mod.morning_volume(s, p, target=config.morning_target_volume),
             )
 
         async def on_night() -> None:
-            await run_effect(
-                effects.night_effect,
-                None,
-                lambda s, p: spotify_mod.night_volume(s, p, target=state.night_target_volume),
-            )
+            # Night drives its own volume internally so the fade is synced
+            # with the lights' settle into the candle state. No separate
+            # volume_choreography needed.
+            await run_effect(effects.night_effect, None, None)
 
         async def on_stop() -> None:
             await stop_effect()
@@ -558,15 +531,14 @@ def home() -> None:
         ui.timer(0.5, sync_sliders_from_state)
 
         def save_as_day_target() -> None:
-            """Snapshot the current manual-color slider state into BRIGHT_WHITE
-            and persist it. The new value applies to morning/rooster/gong/gavel
-            on their next run."""
+            """Snapshot the current manual-color slider state into
+            `config.bright_white` and persist it. The new value applies to
+            morning/rooster/gong/gavel on their next run."""
             bri = bri_slider.value / 100
             r = max(0, min(255, int(r_slider.value * bri)))
             g = max(0, min(255, int(g_slider.value * bri)))
             b = max(0, min(255, int(b_slider.value * bri)))
-            effects.set_bright_white(r, g, b)
-            save_prefs()
+            config.update(bright_white=(r, g, b))
             ui.notify(f"Day target saved: ({r}, {g}, {b})")
 
         ui.button(
@@ -581,8 +553,7 @@ def home() -> None:
         with ui.row().classes("items-center gap-2 w-full"):
             audio_override_input = ui.number(
                 "Audio override (ms)",
-                value=(state.audio_latency_override_s * 1000)
-                if state.audio_latency_override_s is not None else None,
+                value=config.audio_latency_override_ms,
                 format="%.0f", min=0, max=2000,
             ).classes("flex-1")
             ui.button(
@@ -593,8 +564,7 @@ def home() -> None:
         with ui.row().classes("items-center gap-2 w-full"):
             hue_override_input = ui.number(
                 "Hue override (ms)",
-                value=(state.hue_latency_override_s * 1000)
-                if state.hue_latency_override_s is not None else None,
+                value=config.hue_latency_override_ms,
                 format="%.0f", min=0, max=500,
             ).classes("flex-1")
             ui.button(
@@ -608,13 +578,13 @@ def home() -> None:
 
         def _audio_override_changed(_e) -> None:
             v = audio_override_input.value
-            state.audio_latency_override_s = (v / 1000) if v not in (None, "") else None
-            save_prefs()
+            ms = float(v) if v not in (None, "") else None
+            config.update(audio_latency_override_ms=ms)
 
         def _hue_override_changed(_e) -> None:
             v = hue_override_input.value
-            state.hue_latency_override_s = (v / 1000) if v not in (None, "") else None
-            save_prefs()
+            ms = float(v) if v not in (None, "") else None
+            config.update(hue_latency_override_ms=ms)
 
         audio_override_input.on("change", _audio_override_changed)
         hue_override_input.on("change", _hue_override_changed)
@@ -801,12 +771,11 @@ def home() -> None:
             mode, mean_s = state.calibration_pending
             mean_ms = mean_s * 1000
             if mode == "audio":
-                state.audio_latency_override_s = mean_s
+                config.update(audio_latency_override_ms=mean_ms)
                 audio_override_input.value = round(mean_ms)
             else:
-                state.hue_latency_override_s = mean_s
+                config.update(hue_latency_override_ms=mean_ms)
                 hue_override_input.value = round(mean_ms)
-            save_prefs()
             ui.notify(f"{mode.title()} latency calibrated: {mean_ms:.0f}ms")
             logger.info(
                 "[calibrate] %s mean=%.3fs (%d taps)", mode, mean_s,
@@ -869,55 +838,42 @@ def home() -> None:
         ui.keyboard(on_key=on_keydown)
 
         # ── SPOTIFY VOLUME ───────────────────────────────────────────
+        # No preview buttons — clicking the actual effect (Morning, Night)
+        # demonstrates the real volume choreography.
         ui.label("Spotify volume").classes(_hdr_break)
-        with ui.row().classes("items-center gap-2 w-full"):
-            day_input = (
-                ui.number("Day target %", value=state.morning_target_volume,
-                          min=0, max=100, step=1)
-                .bind_value(state, "morning_target_volume")
-                .classes("flex-1")
-            )
-            day_input.on("change", lambda _e: save_prefs())
-
-            async def test_day() -> None:
-                await spotify_mod.morning_volume(
-                    state.spotify, state.last_volume, target=state.morning_target_volume
-                )
-
-            ui.button(icon="play_arrow", on_click=test_day).props("size=sm flat")
-        with ui.row().classes("items-center gap-2 w-full"):
-            night_input = (
-                ui.number("Night target %", value=state.night_target_volume,
-                          min=0, max=100, step=1)
-                .bind_value(state, "night_target_volume")
-                .classes("flex-1")
-            )
-            night_input.on("change", lambda _e: save_prefs())
-
-            async def test_night() -> None:
-                await spotify_mod.night_volume(
-                    state.spotify, state.last_volume, target=state.night_target_volume
-                )
-
-            ui.button(icon="play_arrow", on_click=test_night).props("size=sm flat")
+        day_input = (
+            ui.number("Day target %", value=config.morning_target_volume,
+                      min=0, max=100, step=1)
+            .bind_value(config, "morning_target_volume")
+            .classes("w-full")
+        )
+        day_input.on("change", lambda _e: config.save())
+        night_input = (
+            ui.number("Night target %", value=config.night_target_volume,
+                      min=0, max=100, step=1)
+            .bind_value(config, "night_target_volume")
+            .classes("w-full")
+        )
+        night_input.on("change", lambda _e: config.save())
 
         # ── INTERNAL AUDIO ───────────────────────────────────────────
         ui.label("Internal audio").classes(_hdr_break)
         ui.label("Effects volume %").classes(_sub)
         audio_vol_slider = ui.slider(
-            min=0, max=100, value=int(state.internal_audio_volume * 100)
+            min=0, max=100, value=int(config.internal_audio_volume * 100)
         ).props("label-always")
 
         def _push_audio_vol(persist: bool = True) -> None:
             v = audio_vol_slider.value / 100
-            state.internal_audio_volume = v
             for au in (*all_audio, click_audio):
                 ui.run_javascript(
                     f'const el = document.getElementById("c{au.id}");'
                     f' if (el) el.volume = {v};'
                 )
             if persist:
-                save_prefs()
+                config.update(internal_audio_volume=v)
+            else:
+                config.internal_audio_volume = v
 
         audio_vol_slider.on("change", lambda _e: _push_audio_vol())
 
@@ -935,7 +891,7 @@ def home() -> None:
 
     def tail_log() -> None:
         try:
-            with open(LOG_FILE, "r") as f:
+            with open(LOG_FILE) as f:
                 f.seek(state.log_offset)
                 new_data = f.read()
                 state.log_offset = f.tell()
@@ -956,24 +912,29 @@ def home() -> None:
         state.expanded_mode = not state.expanded_mode
         config_col.set_visibility(state.expanded_mode)
         log_viewer.set_visibility(state.expanded_mode)
+        # Native window only exists when running under pywebview; in
+        # browser-only mode app.native.main_window is None.
+        window = app.native.main_window
         if state.expanded_mode:
             # Each column takes half the row; their internal max-w + items-center
             # keep content clustered in the middle of each half.
             controls_col.classes(remove="w-full", add="w-1/2")
             toggle_btn.props("icon=unfold_less")
             toggle_btn.tooltip("Hide config + logs")
-            try:
-                app.native.main_window.resize(960, 720)
-            except Exception as exc:
-                logger.info("window resize unavailable: %s", exc)
+            if window is not None:
+                try:
+                    window.resize(960, 720)  # ty: ignore[unresolved-attribute]
+                except Exception as exc:
+                    logger.info("window resize unavailable: %s", exc)
         else:
             controls_col.classes(remove="w-1/2", add="w-full")
             toggle_btn.props("icon=unfold_more")
             toggle_btn.tooltip("Show config + logs")
-            try:
-                app.native.main_window.resize(360, 720)
-            except Exception as exc:
-                logger.info("window resize unavailable: %s", exc)
+            if window is not None:
+                try:
+                    window.resize(360, 720)  # ty: ignore[unresolved-attribute]
+                except Exception as exc:
+                    logger.info("window resize unavailable: %s", exc)
 
     toggle_btn.on_click(toggle_expanded)
 

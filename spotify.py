@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
-from typing import Optional
 
 import effects
 
@@ -35,7 +34,7 @@ class SpotifyController:
         except Exception:
             return False
 
-    def _get_volume_sync(self) -> Optional[int]:
+    def _get_volume_sync(self) -> int | None:
         if not self.is_running():
             return None
         try:
@@ -66,7 +65,7 @@ class SpotifyController:
         except Exception as exc:
             logger.warning("set_volume failed: %s", exc)
 
-    def _get_track_sync(self) -> Optional[str]:
+    def _get_track_sync(self) -> str | None:
         if not self.is_running():
             return None
         try:
@@ -85,13 +84,13 @@ class SpotifyController:
         except Exception:
             return None
 
-    async def get_volume(self) -> Optional[int]:
+    async def get_volume(self) -> int | None:
         return await asyncio.to_thread(self._get_volume_sync)
 
     async def set_volume(self, percent: int) -> None:
         await asyncio.to_thread(self._set_volume_sync, percent)
 
-    async def get_track(self) -> Optional[str]:
+    async def get_track(self) -> str | None:
         return await asyncio.to_thread(self._get_track_sync)
 
 
@@ -145,11 +144,4 @@ async def morning_volume(
     spotify: SpotifyController, prev_vol: int, *, target: int = 50
 ) -> None:
     """Day setpoint: fade to `target`% over 1s. No auto-restore."""
-    await _stepped_fade(spotify, prev_vol, target, duration=1.0, steps=10)
-
-
-async def night_volume(
-    spotify: SpotifyController, prev_vol: int, *, target: int = 100
-) -> None:
-    """Night setpoint: fade to `target`% over 1s. No auto-restore."""
     await _stepped_fade(spotify, prev_vol, target, duration=1.0, steps=10)
