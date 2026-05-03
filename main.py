@@ -240,8 +240,13 @@ def home() -> None:
         gong_audio = ui.audio("/sounds/gong.wav").props("preload=auto").style("display: none")
         gavel_audio = ui.audio("/sounds/gavel.wav").props("preload=auto").style("display: none")
         rooster_audio = ui.audio("/sounds/rooster.wav").props("preload=auto").style("display: none")
+        good_victory_audio = ui.audio("/sounds/good_victory.wav").props("preload=auto").style("display: none")
+        evil_victory_audio = ui.audio("/sounds/evil_victory.wav").props("preload=auto").style("display: none")
         click_audio = ui.audio("/sounds/click.wav").props("preload=auto").style("display: none")
-        all_audio = (thunder_audio, gong_audio, gavel_audio, rooster_audio)
+        all_audio = (
+            thunder_audio, gong_audio, gavel_audio, rooster_audio,
+            good_victory_audio, evil_victory_audio,
+        )
 
         async def run_effect(coro_factory, audio_el=None, volume_choreography=None) -> None:
             t_click = time.monotonic()
@@ -350,6 +355,12 @@ def home() -> None:
             # volume_choreography needed.
             await run_effect(effects.night_effect, None, None)
 
+        async def on_good_victory() -> None:
+            await run_effect(effects.good_victory_effect, good_victory_audio, spotify_mod.good_victory_volume)
+
+        async def on_evil_victory() -> None:
+            await run_effect(effects.evil_victory_effect, evil_victory_audio, spotify_mod.evil_victory_volume)
+
         async def on_stop() -> None:
             await stop_effect()
             for a in all_audio:
@@ -395,13 +406,28 @@ def home() -> None:
                 .classes("w-16 h-16 text-3xl")
             )
             night_btn.tooltip("Night")
+            good_victory_btn = (
+                ui.button(icon="celebration", on_click=on_good_victory)
+                .props("color=blue")
+                .classes("w-16 h-16 text-3xl")
+            )
+            good_victory_btn.tooltip("Good Victory")
+            evil_victory_btn = (
+                ui.button(icon="whatshot", on_click=on_evil_victory)
+                .props("color=red")
+                .classes("w-16 h-16 text-3xl")
+            )
+            evil_victory_btn.tooltip("Evil Victory")
 
         # Stop bar — small, full-width
         ui.button("Stop", icon="stop", on_click=on_stop).props(
             "flat color=grey"
         ).classes("w-full text-xs")
 
-        effect_buttons = (lightning_btn, gong_btn, gavel_btn, rooster_btn, morning_btn, night_btn)
+        effect_buttons = (
+            lightning_btn, gong_btn, gavel_btn, rooster_btn, morning_btn, night_btn,
+            good_victory_btn, evil_victory_btn,
+        )
         for btn in effect_buttons:
             btn.disable()
 

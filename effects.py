@@ -18,11 +18,16 @@ analysis accessors so existing import paths keep working.
 from __future__ import annotations
 
 import asyncio
+import random
+from dataclasses import dataclass
 
 from analysis import (
     GongAnalysis,
     ThunderAnalysis,
+    VictoryAnalysis,
+    get_evil_victory,
     get_gong,
+    get_good_victory,
     get_thunder,
     warm_cache,
 )
@@ -42,10 +47,15 @@ from signals import (
 
 __all__ = [
     # Re-exports
-    "GongAnalysis", "ThunderAnalysis", "get_gong", "get_thunder", "warm_cache",
+    "GongAnalysis", "ThunderAnalysis", "VictoryAnalysis",
+    "get_evil_victory", "get_gong", "get_good_victory", "get_thunder",
+    "warm_cache",
     # Effects
     "gavel_effect", "gong_effect", "lightning_effect",
     "morning_effect", "night_effect",
+    "good_victory_effect", "evil_victory_effect",
+    # Constants exposed for tests
+    "GOOD_FIREWORKS", "EVIL_FIREWORKS", "FIREWORK_COLORS",
 ]
 
 
@@ -342,3 +352,165 @@ async def _fade_volume_synced(
         v = int(round(start + (end - start) * f))
         await spotify.set_volume(v)
         await clock.sleep(step_dur)
+
+
+# ────────────────────────── Victory ─────────────────────────────────
+#
+# Two clips (good_victory.wav / evil_victory.wav) sharing the same
+# choreographic shape: random-multicolor firework flashes over a themed
+# dim background, then a lift to the full themed accent color (blue for
+# good, red for evil) that holds — RMS-pulsed — through the trumpet /
+# evil-laugh tail before settling to BRIGHT_WHITE.
+#
+# Firework times come from the HF-flux onset analysis in
+# `_victory_analysis.py`; tail-start is where spectral flatness collapses
+# (good: trumpet onset; evil: laugh onset).
+#
+# The firework picks (channel + color) are drawn fresh on every effect
+# run via `random` — so each press is a different sequence. Within a run
+# the picks are stable across the flash+fade window for each firework.
+
+GOOD_FIREWORKS = [0.232, 0.906, 1.718, 2.322, 2.577, 2.995, 3.297, 3.971]
+EVIL_FIREWORKS = [0.093, 0.372, 0.906, 1.579, 2.206, 2.856, 3.181, 3.855]
+GOOD_TAIL_START = 4.80   # trumpet fanfare onset
+EVIL_TAIL_START = 4.67   # evil laugh onset
+
+
+@dataclass(frozen=True)
+class VictoryPalette:
+    bg_dim: tuple[int, int, int]
+    accent: tuple[int, int, int]
+
+
+GOOD_PALETTE = VictoryPalette(
+    bg_dim=(4, 16, 50),    # barely-lit deep blue between pops
+    accent=(0, 80, 255),   # full saturated blue (trumpet hold)
+)
+
+EVIL_PALETTE = VictoryPalette(
+    bg_dim=(40, 5, 5),     # ember red
+    accent=(255, 20, 0),   # full saturated red (laugh hold)
+)
+
+# Vivid party-firework palette. Shared between good and evil — only the
+# tail color differs. Includes white so the occasional bright pop reads
+# as a magnesium flash.
+FIREWORK_COLORS: list[tuple[int, int, int]] = [
+    (255, 60, 60),     # red
+    (255, 130, 0),     # orange
+    (255, 230, 0),     # yellow
+    (100, 255, 30),    # lime
+    (0, 220, 220),     # cyan
+    (60, 120, 255),    # electric blue
+    (200, 0, 255),     # magenta
+    (255, 30, 150),    # hot pink
+    (255, 255, 255),   # white
+]
+
+_FW_FLASH_DUR = 0.08
+_FW_FADE_DUR = 0.30
+_TAIL_LIFT_DUR = 0.40
+_VICTORY_SETTLE_DUR = 1.5
+
+
+def _tail_color(
+    accent: tuple[int, int, int],
+    env: Envelope,
+    t: float,
+) -> tuple[int, int, int]:
+    """Accent color modulated by RMS so the bulbs pulse with the trumpet/
+    laugh syllables. Wider quiver range than the lightning ambient (~0.7
+    floor) so the laugh's "HA-HA-HA" alternation is visible."""
+    q = quiver(env.at(t), low=0.7, high=1.0, gamma=0.5)
+    return scale(accent, q)
+
+
+def _random_firework_picks(
+    n: int,
+) -> list[tuple[int, tuple[int, int, int]]]:
+    """One (channel, color) per firework, drawn fresh each call. No
+    constraints — channel and color are both fully random, so consecutive
+    pops can land on the same bulb or repeat a color. That's the user's
+    'fully random, decided in the moment' brief."""
+    return [
+        (random.randrange(3), random.choice(FIREWORK_COLORS))
+        for _ in range(n)
+    ]
+
+
+async def _victory_effect(
+    ctl: LightController,
+    config: Config,
+    clock: ClockLike,
+    *,
+    analysis: VictoryAnalysis,
+    fireworks: list[float],
+    tail_start: float,
+    palette: VictoryPalette,
+) -> None:
+    """Shared good/evil choreography. Fireworks phase: themed dim
+    background with one randomly-coloured channel flash per pop. Tail
+    phase: all 3 channels lift to the full themed accent color and pulse
+    with RMS until the audio ends, then settle to BRIGHT_WHITE."""
+    env = Envelope(samples=analysis.rms, hop_seconds=analysis.hop_seconds)
+    bg_dim = palette.bg_dim
+    accent = palette.accent
+
+    picks = _random_firework_picks(len(fireworks))
+
+    last_strike = max(fireworks) if fireworks else 0.0
+    main_duration = max(
+        analysis.duration, last_strike + _FW_FLASH_DUR + _FW_FADE_DUR + 0.1
+    )
+
+    def frame(t: float):
+        if t < tail_start:
+            ch_colors = [bg_dim, bg_dim, bg_dim]
+            for s_t, (ch, color) in zip(fireworks, picks):
+                if s_t > t:
+                    break
+                d = t - s_t
+                if d < _FW_FLASH_DUR:
+                    ch_colors[ch] = color
+                elif d < _FW_FLASH_DUR + _FW_FADE_DUR:
+                    f = quadratic_in((d - _FW_FLASH_DUR) / _FW_FADE_DUR)
+                    ch_colors[ch] = lerp(color, bg_dim, f)
+            return ch_colors
+
+        # Tail phase — same as the v2 trial: lift to full accent, hold
+        # with RMS pulse, then settle to BRIGHT_WHITE.
+        d = t - tail_start
+        target = _tail_color(accent, env, t)
+        if d < _TAIL_LIFT_DUR:
+            f = smoothstep(d / _TAIL_LIFT_DUR)
+            return [lerp(bg_dim, target, f) for _ in range(3)]
+        return [target, target, target]
+
+    await frame_loop(ctl, clock, main_duration, frame)
+    await _settle_to_bright_white(ctl, config, clock, duration=_VICTORY_SETTLE_DUR)
+
+
+async def good_victory_effect(
+    ctl: LightController, config: Config, *, clock: ClockLike | None = None
+) -> None:
+    """Random multicolor fireworks → all-channel blue hold under the
+    trumpet → settle to BRIGHT_WHITE."""
+    clock = _resolve_clock(clock)
+    await _victory_effect(
+        ctl, config, clock,
+        analysis=get_good_victory(),
+        fireworks=GOOD_FIREWORKS, tail_start=GOOD_TAIL_START, palette=GOOD_PALETTE,
+    )
+
+
+async def evil_victory_effect(
+    ctl: LightController, config: Config, *, clock: ClockLike | None = None
+) -> None:
+    """Random multicolor fireworks → all-channel red hold under the evil
+    laugh → settle to BRIGHT_WHITE."""
+    clock = _resolve_clock(clock)
+    await _victory_effect(
+        ctl, config, clock,
+        analysis=get_evil_victory(),
+        fireworks=EVIL_FIREWORKS, tail_start=EVIL_TAIL_START, palette=EVIL_PALETTE,
+    )

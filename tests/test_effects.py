@@ -24,10 +24,12 @@ from tests.trace import sparse_table, summarize
 
 @pytest.fixture(scope="session", autouse=True)
 def _warm_audio_cache():
-    """Load thunder + gong analyses once per session — pytest-asyncio cannot
+    """Load all sound analyses once per session — pytest-asyncio cannot
     use this fixture in async form, so we call the sync getters directly."""
     effects.get_thunder()
     effects.get_gong()
+    effects.get_good_victory()
+    effects.get_evil_victory()
 
 
 @pytest.fixture
@@ -324,6 +326,71 @@ async def test_night_drives_volume_synced_with_lights(cfg: Config):
     assert volumes[-1] == 80, f"final volume should hit night_target_volume=80, got {volumes[-1]}"
     # Fade is monotonic upward toward target.
     assert volumes == sorted(volumes), f"volume fade should be monotonic; got {volumes}"
+
+
+VICTORY_EFFECTS = [
+    ("good_victory_effect", "good", 4.80),
+    ("evil_victory_effect", "evil", 4.67),
+]
+
+
+@pytest.mark.parametrize("name,kind,tail_start", VICTORY_EFFECTS)
+async def test_victory_effect(cfg: Config, name: str, kind: str, tail_start: float):
+    """Both victory effects: trace runs to the expected length, the tail
+    hold is uniform across channels (the 'all lights go blue/red'
+    requirement), and the final frame is BRIGHT_WHITE on all channels."""
+    clock = VirtualClock()
+    rec = RecordingController(clock)
+    coro = getattr(effects, name)
+    await coro(rec, cfg, clock=clock)
+    audio = effects.get_good_victory() if kind == "good" else effects.get_evil_victory()
+    _check_invariants(name, rec, expected_seconds=audio.duration + 1.5)
+    assert rec.events[-1][1] == (BRIGHT_WHITE,) * 3, (
+        f"{name} should settle on BRIGHT_WHITE on all channels, got {rec.events[-1][1]}"
+    )
+    # Tail hold (after the lift): all 3 channels match each other on every frame.
+    tail_frames = [
+        snap for t, snap in rec.events
+        if tail_start + 0.5 < t < audio.duration - 0.1
+    ]
+    assert tail_frames, f"{name} produced no frames in the tail window"
+    assert all(len(set(snap)) == 1 for snap in tail_frames), (
+        f"{name} tail frames must be uniform across channels (all 3 same color)"
+    )
+
+
+async def test_victory_picks_random_per_run(cfg: Config):
+    """Firework picks (channel + color) must be drawn fresh each run via
+    `random` — not fixed at module load. Two runs in a row should produce
+    different (channel, flash_color) sequences. With 8 fireworks × 27
+    possible (channel, color) outcomes per pop, the probability of both
+    runs being identical by chance is ~10^-22."""
+    def capture_picks(rec):
+        picks = []
+        for s_t in effects.GOOD_FIREWORKS:
+            nearby = [
+                (t, snap) for t, snap in rec.events
+                if s_t <= t < s_t + 0.04  # well inside FLASH_DUR before the fade kicks in
+            ]
+            if not nearby:
+                continue
+            # Brightest frame in window — that's the flash itself.
+            _, snap = max(nearby, key=lambda x: max(sum(c) for c in x[1]))
+            ch = max(range(3), key=lambda c: sum(snap[c]))
+            picks.append((ch, snap[ch]))
+        return tuple(picks)
+
+    runs = []
+    for _ in range(3):
+        clock = VirtualClock()
+        rec = RecordingController(clock)
+        await effects.good_victory_effect(rec, cfg, clock=clock)
+        runs.append(capture_picks(rec))
+
+    assert len(set(runs)) >= 2, (
+        f"all 3 runs of good_victory_effect produced identical firework picks "
+        f"({runs[0]}) — randomness is not being applied per-run"
+    )
 
 
 async def test_night_volume_skipped_without_spotify(cfg: Config):

@@ -145,3 +145,19 @@ async def morning_volume(
 ) -> None:
     """Day setpoint: fade to `target`% over 1s. No auto-restore."""
     await _stepped_fade(spotify, prev_vol, target, duration=1.0, steps=10)
+
+
+async def good_victory_volume(spotify: SpotifyController, prev_vol: int) -> None:
+    """Duck to 20% across the whole victory clip (fireworks + trumpet),
+    restore on completion. Same shape as `lightning_volume`."""
+    await spotify.set_volume(20)
+    await asyncio.sleep(effects.get_good_victory().duration)
+    await spotify.set_volume(prev_vol)
+
+
+async def evil_victory_volume(spotify: SpotifyController, prev_vol: int) -> None:
+    """Duck to 20% across the whole victory clip (fireworks + laugh),
+    restore on completion."""
+    await spotify.set_volume(20)
+    await asyncio.sleep(effects.get_evil_victory().duration)
+    await spotify.set_volume(prev_vol)

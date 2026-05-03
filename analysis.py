@@ -34,8 +34,22 @@ class GongAnalysis:
     hop_seconds: float
 
 
+@dataclass
+class VictoryAnalysis:
+    """Per-frame RMS + duration for a victory clip. Firework times and the
+    fireworks→tail boundary are hardcoded in `effects.py` from offline
+    spectral analysis (HF-flux onsets), same convention as lightning's
+    STRIKES list — so this struct only carries what's used at runtime."""
+
+    duration: float
+    rms: np.ndarray  # normalized 0..1
+    hop_seconds: float
+
+
 _thunder: ThunderAnalysis | None = None
 _gong: GongAnalysis | None = None
+_good_victory: VictoryAnalysis | None = None
+_evil_victory: VictoryAnalysis | None = None
 
 
 def _analyze_thunder() -> ThunderAnalysis:
@@ -81,6 +95,21 @@ def _analyze_gong() -> GongAnalysis:
     )
 
 
+def _analyze_victory(filename: str) -> VictoryAnalysis:
+    import librosa
+
+    path = str(SOUNDS_DIR / filename)
+    y, sr = librosa.load(path, sr=22050, mono=True)
+    hop = 512
+    rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+    rms = rms / (float(rms.max()) + 1e-9)
+    return VictoryAnalysis(
+        duration=float(len(y) / sr),
+        rms=rms.astype(np.float32),
+        hop_seconds=hop / sr,
+    )
+
+
 def get_thunder() -> ThunderAnalysis:
     global _thunder
     if _thunder is None:
@@ -95,9 +124,25 @@ def get_gong() -> GongAnalysis:
     return _gong
 
 
+def get_good_victory() -> VictoryAnalysis:
+    global _good_victory
+    if _good_victory is None:
+        _good_victory = _analyze_victory("good_victory.wav")
+    return _good_victory
+
+
+def get_evil_victory() -> VictoryAnalysis:
+    global _evil_victory
+    if _evil_victory is None:
+        _evil_victory = _analyze_victory("evil_victory.wav")
+    return _evil_victory
+
+
 async def warm_cache() -> None:
     """Pre-compute analyses off the event loop so first click is snappy."""
     await asyncio.gather(
         asyncio.to_thread(get_thunder),
         asyncio.to_thread(get_gong),
+        asyncio.to_thread(get_good_victory),
+        asyncio.to_thread(get_evil_victory),
     )
