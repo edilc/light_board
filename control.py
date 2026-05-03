@@ -9,6 +9,8 @@ virtual clock.
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 import time
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
@@ -20,6 +22,14 @@ from hue_entertainment_pykit import (
     Streaming,
 )
 from hue_entertainment_pykit.models.bridge import Bridge
+from tenacity import (
+    Retrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_fixed,
+)
+
+logger = logging.getLogger("light_board.control")
 
 Color = tuple[int, int, int]
 Snapshot = tuple[Color, ...]
@@ -167,9 +177,17 @@ class RecordingVolumeController:
         self.events.append((self._clock.now(), int(percent)))
 
 
-def connect() -> HueController:
-    """Discover the first bridge, pick the first entertainment area, start
-    streaming, and return a controller. Blocking — call from a thread."""
+# DTLS handshake hangs roughly half the time on this network — succeeds
+# in ~600ms when it works, hangs forever when it doesn't. We retry with
+# progressively longer per-attempt budgets so a fresh socket gets a
+# chance, and the eventual happy attempt isn't capped by an aggressive
+# timeout.
+_CONNECT_TIMEOUTS_S: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
+
+
+def _do_connect() -> HueController:
+    """Discover bridge → entertainment area → start streaming. Blocking;
+    no timeout, no retry. Wrapped by `connect()`."""
     bridges = Discovery().discover_bridges()
     if not bridges:
         raise RuntimeError("No Hue bridge found on the network.")
@@ -187,3 +205,58 @@ def connect() -> HueController:
 
     channel_ids = [ch.channel_id for ch in config.channels]
     return HueController(bridge, entertainment, streaming, config, channel_ids)
+
+
+def _connect_with_timeout(timeout_s: float) -> HueController:
+    """Run `_do_connect` in a daemon thread; raise TimeoutError if it
+    doesn't finish in `timeout_s`. Python can't safely kill a thread, so
+    a hung handshake leaks the worker — daemon=True ensures process exit
+    still cleans it up, and the next attempt starts with a fresh socket."""
+    result: list[HueController] = []
+    err: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            result.append(_do_connect())
+        except BaseException as e:
+            # Forward everything (incl. KeyboardInterrupt) to the joining
+            # thread; this worker is the sole consumer of the exception.
+            err.append(e)
+
+    t = threading.Thread(target=worker, name="hue-connect", daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        raise TimeoutError(f"Hue connect hung past {timeout_s:.1f}s")
+    if err:
+        raise err[0]
+    return result[0]
+
+
+def connect() -> HueController:
+    """Discover the first bridge, pick the first entertainment area, start
+    streaming, and return a controller. Blocking — call from a thread.
+
+    Retries on TimeoutError (the DTLS handshake hanging) with the
+    `_CONNECT_TIMEOUTS_S` budgets — 1s, 2s, 4s, 8s. Other errors (no
+    bridge found, no entertainment area) surface immediately."""
+    for attempt in Retrying(
+        stop=stop_after_attempt(len(_CONNECT_TIMEOUTS_S)),
+        wait=wait_fixed(0.3),
+        retry=retry_if_exception_type(TimeoutError),
+        reraise=True,
+    ):
+        with attempt:
+            i = attempt.retry_state.attempt_number - 1
+            timeout = _CONNECT_TIMEOUTS_S[i]
+            logger.info(
+                "connect attempt %d/%d (timeout=%.1fs)",
+                i + 1, len(_CONNECT_TIMEOUTS_S), timeout,
+            )
+            try:
+                return _connect_with_timeout(timeout)
+            except TimeoutError as e:
+                logger.warning("connect attempt %d/%d timed out: %s",
+                               i + 1, len(_CONNECT_TIMEOUTS_S), e)
+                raise
+    raise RuntimeError("unreachable: Retrying with reraise=True must raise on exhaustion")
