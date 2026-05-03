@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import random
-from dataclasses import dataclass
 
 from analysis import (
     GongAnalysis,
@@ -375,22 +374,15 @@ EVIL_FIREWORKS = [0.093, 0.372, 0.906, 1.579, 2.206, 2.856, 3.181, 3.855]
 GOOD_TAIL_START = 4.80   # trumpet fanfare onset
 EVIL_TAIL_START = 4.67   # evil laugh onset
 
+# Shared resting state between firework pops. Deliberately neutral —
+# previously each palette had its own themed dim (blue / ember red) but
+# that telegraphed the outcome before the trumpet or laugh revealed it.
+# Faint warm white (~5 % of BRIGHT_WHITE) reads as "lights idling" without
+# hinting at good vs. evil.
+_VICTORY_BG_DIM: tuple[int, int, int] = (15, 13, 10)
 
-@dataclass(frozen=True)
-class VictoryPalette:
-    bg_dim: tuple[int, int, int]
-    accent: tuple[int, int, int]
-
-
-GOOD_PALETTE = VictoryPalette(
-    bg_dim=(4, 16, 50),    # barely-lit deep blue between pops
-    accent=(0, 80, 255),   # full saturated blue (trumpet hold)
-)
-
-EVIL_PALETTE = VictoryPalette(
-    bg_dim=(40, 5, 5),     # ember red
-    accent=(255, 20, 0),   # full saturated red (laugh hold)
-)
+GOOD_ACCENT: tuple[int, int, int] = (0, 80, 255)    # full saturated blue (trumpet hold)
+EVIL_ACCENT: tuple[int, int, int] = (255, 20, 0)    # full saturated red (laugh hold)
 
 # Vivid party-firework palette. Shared between good and evil — only the
 # tail color differs. Includes white so the occasional bright pop reads
@@ -452,15 +444,14 @@ async def _victory_effect(
     analysis: VictoryAnalysis,
     fireworks: list[float],
     tail_start: float,
-    palette: VictoryPalette,
+    accent: tuple[int, int, int],
 ) -> None:
-    """Shared good/evil choreography. Fireworks phase: themed dim
+    """Shared good/evil choreography. Fireworks phase: neutral dim
     background with one randomly-coloured channel flash per pop. Tail
-    phase: all 3 channels lift to the full themed accent color and pulse
+    phase: all 3 channels lift to the (themed) accent color and pulse
     with RMS until the audio ends, then settle to BRIGHT_WHITE."""
     env = Envelope(samples=analysis.rms, hop_seconds=analysis.hop_seconds)
-    bg_dim = palette.bg_dim
-    accent = palette.accent
+    bg_dim = _VICTORY_BG_DIM
 
     picks = _random_firework_picks(len(fireworks))
 
@@ -500,12 +491,13 @@ async def good_victory_effect(
     ctl: LightController, config: Config, *, clock: ClockLike | None = None
 ) -> None:
     """Random multicolor fireworks → all-channel blue hold under the
-    trumpet → settle to BRIGHT_WHITE."""
+    trumpet → settle to BRIGHT_WHITE. The neutral resting state means
+    you can't tell good from evil until the tail kicks in."""
     clock = _resolve_clock(clock)
     await _victory_effect(
         ctl, config, clock,
         analysis=get_good_victory(),
-        fireworks=GOOD_FIREWORKS, tail_start=GOOD_TAIL_START, palette=GOOD_PALETTE,
+        fireworks=GOOD_FIREWORKS, tail_start=GOOD_TAIL_START, accent=GOOD_ACCENT,
     )
 
 
@@ -513,10 +505,11 @@ async def evil_victory_effect(
     ctl: LightController, config: Config, *, clock: ClockLike | None = None
 ) -> None:
     """Random multicolor fireworks → all-channel red hold under the evil
-    laugh → settle to BRIGHT_WHITE."""
+    laugh → settle to BRIGHT_WHITE. The neutral resting state means you
+    can't tell evil from good until the tail kicks in."""
     clock = _resolve_clock(clock)
     await _victory_effect(
         ctl, config, clock,
         analysis=get_evil_victory(),
-        fireworks=EVIL_FIREWORKS, tail_start=EVIL_TAIL_START, palette=EVIL_PALETTE,
+        fireworks=EVIL_FIREWORKS, tail_start=EVIL_TAIL_START, accent=EVIL_ACCENT,
     )
