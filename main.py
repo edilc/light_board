@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from statistics import mean as _mean, stdev
 from pathlib import Path
 from typing import Optional
 
@@ -94,6 +95,14 @@ class AppState:
     # responsive breakpoints don't fire reliably inside pywebview, so we
     # gate visibility on this boolean instead.
     expanded_mode: bool = False
+    # Spacebar-tap calibration runtime state. `mode` is "audio" or "light"
+    # while a calibration session is active (None otherwise). `taps` is a
+    # rolling window of the last 5 tap-time-minus-beat-time offsets.
+    calibration_mode: Optional[str] = None
+    calibration_taps: list = field(default_factory=list)
+    calibration_beat_t: float = 0.0
+    calibration_task: Optional[asyncio.Task] = None
+    calibration_pending: Optional[tuple] = None  # (mode, mean_seconds) when locked in
 
 
 state = AppState()
@@ -106,6 +115,10 @@ state.night_target_volume = int(_loaded_prefs["night_target_volume"])
 state.internal_audio_volume = float(_loaded_prefs["internal_audio_volume"])
 _bw = _loaded_prefs["bright_white"]
 effects.set_bright_white(_bw[0], _bw[1], _bw[2])
+_audio_ms = _loaded_prefs.get("audio_latency_override_ms")
+_hue_ms = _loaded_prefs.get("hue_latency_override_ms")
+state.audio_latency_override_s = (_audio_ms / 1000) if _audio_ms is not None else None
+state.hue_latency_override_s = (_hue_ms / 1000) if _hue_ms is not None else None
 
 
 def save_prefs() -> None:
@@ -116,6 +129,14 @@ def save_prefs() -> None:
         "night_target_volume": state.night_target_volume,
         "internal_audio_volume": state.internal_audio_volume,
         "dark_mode": _loaded_prefs.get("dark_mode", False),
+        "audio_latency_override_ms": (
+            state.audio_latency_override_s * 1000
+            if state.audio_latency_override_s is not None else None
+        ),
+        "hue_latency_override_ms": (
+            state.hue_latency_override_s * 1000
+            if state.hue_latency_override_s is not None else None
+        ),
     })
 
 
@@ -255,23 +276,18 @@ def home() -> None:
                 logger.info("[%s] aborting: manual override active", name)
                 return
             if audio_el is not None:
-                t_pre_play = time.monotonic()
-                audio_el.play()
-                logger.info(
-                    "[%s] audio.play() dispatched at +%.0fms",
-                    name, (t_pre_play - t_click) * 1000,
-                )
-                t_pre_detect = time.monotonic()
-                try:
-                    state.audio_latency_s = await detect_audio_latency()
-                    detect_ms = (time.monotonic() - t_pre_detect) * 1000
-                    logger.info(
-                        "[%s] outputLatency=%.3fs (probe took %.0fms)",
-                        name, state.audio_latency_s, detect_ms,
-                    )
-                except Exception as exc:
-                    logger.warning("[%s] latency probe failed: %s", name, exc)
-                # Apply config-panel overrides if set, else fall back to detected/constant.
+                # Probe outputLatency only when there's no calibrated override.
+                if state.audio_latency_override_s is None:
+                    t_pre_detect = time.monotonic()
+                    try:
+                        state.audio_latency_s = await detect_audio_latency()
+                        detect_ms = (time.monotonic() - t_pre_detect) * 1000
+                        logger.info(
+                            "[%s] outputLatency=%.3fs (probe took %.0fms)",
+                            name, state.audio_latency_s, detect_ms,
+                        )
+                    except Exception as exc:
+                        logger.warning("[%s] latency probe failed: %s", name, exc)
                 audio_lat = (
                     state.audio_latency_override_s
                     if state.audio_latency_override_s is not None
@@ -282,13 +298,22 @@ def home() -> None:
                     if state.hue_latency_override_s is not None
                     else HUE_LATENCY_S
                 )
-                delay = max(0.0, audio_lat - hue_lat)
+                # Delay whichever side is faster so both arrive together.
+                audio_lead = max(0.0, hue_lat - audio_lat)
+                light_lead = max(0.0, audio_lat - hue_lat)
                 logger.info(
-                    "[%s] computed light delay = max(0, %.3fs - %.3fs) = %.0fms",
-                    name, audio_lat, hue_lat, delay * 1000,
+                    "[%s] audio_lead=%.0fms light_lead=%.0fms (audio=%.3fs hue=%.3fs)",
+                    name, audio_lead * 1000, light_lead * 1000, audio_lat, hue_lat,
                 )
-                if delay > 0:
-                    await asyncio.sleep(delay)
+                if audio_lead > 0:
+                    await asyncio.sleep(audio_lead)
+                audio_el.play()
+                logger.info(
+                    "[%s] audio.play() dispatched at +%.0fms",
+                    name, (time.monotonic() - t_click) * 1000,
+                )
+                if light_lead > 0:
+                    await asyncio.sleep(light_lead)
             state.effect_task = asyncio.create_task(coro_factory(state.controller))
             logger.info(
                 "[%s] light task created at +%.0fms after click",
@@ -533,24 +558,28 @@ def home() -> None:
         detected_label = ui.label(
             f"Detected audio: {state.audio_latency_s * 1000:.0f}ms"
         ).classes(_sub)
-        audio_override_input = ui.number(
-            "Audio override (ms)", value=None, format="%.0f", min=0, max=2000
-        ).classes("w-full")
-        ui.label(f"Hue assumed: {HUE_LATENCY_S * 1000:.0f}ms").classes(_sub + " mt-1")
-        hue_override_input = ui.number(
-            "Hue override (ms)", value=None, format="%.0f", min=0, max=500
-        ).classes("w-full")
-        with ui.row().classes("items-center gap-3 mt-2"):
-            light_indicator = (
-                ui.icon("lightbulb").classes("text-3xl").style("color: #ddd")
-            )
-            sound_indicator = (
-                ui.icon("volume_up").classes("text-3xl").style("color: #ddd")
-            )
+        with ui.row().classes("items-center gap-2 w-full"):
+            audio_override_input = ui.number(
+                "Audio override (ms)",
+                value=(state.audio_latency_override_s * 1000)
+                if state.audio_latency_override_s is not None else None,
+                format="%.0f", min=0, max=2000,
+            ).classes("flex-1")
             ui.button(
-                "Test",
-                icon="play_arrow",
-                on_click=lambda: asyncio.create_task(on_latency_test()),
+                "Calibrate", icon="straighten",
+                on_click=lambda: asyncio.create_task(start_calibration("audio")),
+            ).props("size=sm color=primary")
+        ui.label(f"Hue assumed: {HUE_LATENCY_S * 1000:.0f}ms").classes(_sub + " mt-1")
+        with ui.row().classes("items-center gap-2 w-full"):
+            hue_override_input = ui.number(
+                "Hue override (ms)",
+                value=(state.hue_latency_override_s * 1000)
+                if state.hue_latency_override_s is not None else None,
+                format="%.0f", min=0, max=500,
+            ).classes("flex-1")
+            ui.button(
+                "Calibrate", icon="straighten",
+                on_click=lambda: asyncio.create_task(start_calibration("light")),
             ).props("size=sm color=primary")
 
         click_audio = (
@@ -560,56 +589,244 @@ def home() -> None:
         def _audio_override_changed(_e) -> None:
             v = audio_override_input.value
             state.audio_latency_override_s = (v / 1000) if v not in (None, "") else None
+            save_prefs()
 
         def _hue_override_changed(_e) -> None:
             v = hue_override_input.value
             state.hue_latency_override_s = (v / 1000) if v not in (None, "") else None
+            save_prefs()
 
         audio_override_input.on("change", _audio_override_changed)
         hue_override_input.on("change", _hue_override_changed)
 
-        async def _flash_indicator(indicator, delay_s: float, color: str) -> None:
-            if delay_s > 0:
-                await asyncio.sleep(delay_s)
-            indicator.style(f"color: {color}")
-            await asyncio.sleep(0.2)
-            indicator.style("color: #ddd")
+        # ── Calibration dialog ──────────────────────────────────────
+        with ui.dialog() as calibrate_dialog, ui.card().classes("gap-2 items-center w-96"):
+            cal_title = ui.label("Calibrate").classes("text-base font-semibold")
+            cal_indicator = ui.icon("circle").classes("text-6xl transition-colors").style(
+                "color: #d1d5db"
+            )
+            cal_tap_btn = (
+                ui.button("Tap", icon="touch_app")
+                .props("color=primary size=xl unelevated")
+                .classes("w-40")
+            )
+            cal_status = ui.label(
+                "Click Tap (or press Enter) on each beat. Locks in after 5 consistent taps."
+            ).classes("text-xs text-gray-500 text-center")
+            ui.label("100 BPM • 600ms / beat").classes("text-xs text-gray-400")
 
-        async def on_latency_test() -> None:
-            audio_lat = (
-                state.audio_latency_override_s
-                if state.audio_latency_override_s is not None
-                else state.audio_latency_s
+            # Live feed: each beat appends a "Press!" line; on tap we annotate
+            # the most recent un-tapped line with the offset. Newest at the
+            # bottom, scrolls into view as more beats arrive.
+            cal_feed = ui.column().classes(
+                "w-72 h-28 overflow-y-auto items-start gap-0 px-2 py-1"
+                " border border-gray-200 dark:border-gray-700 rounded text-sm font-mono"
             )
-            hue_lat = (
-                state.hue_latency_override_s
-                if state.hue_latency_override_s is not None
-                else HUE_LATENCY_S
-            )
-            light_delay = max(0.0, audio_lat - hue_lat)
-            logger.info(
-                "[latency_test] audio_lat=%.3fs hue_lat=%.3fs light_delay=%.3fs",
-                audio_lat, hue_lat, light_delay,
-            )
-            click_audio.play()
 
-            async def _fire_light() -> None:
-                if light_delay > 0:
-                    await asyncio.sleep(light_delay)
-                if state.controller is not None and not state.manual_override_active:
-                    saved = state.controller.last_colors
-                    state.controller.set_color(255, 255, 255)
-                    await asyncio.sleep(0.2)
-                    if saved:
-                        state.controller.set_colors(list(saved))
+            cal_taps_label = ui.label("Taps: 0/5").classes("text-xs text-gray-500")
+            cal_stddev_label = ui.label("stddev: —").classes("text-xs text-gray-500")
+            cal_result = ui.label("").classes("text-base font-medium mt-1")
+            with ui.row().classes("gap-2 mt-1"):
+                cal_apply_btn = ui.button("Apply", icon="check").props("color=primary size=sm")
+                cal_cancel_btn = ui.button("Cancel", icon="close").props("flat size=sm")
+
+        cal_apply_btn.set_visibility(False)
+
+        # Recent feed entries: each is [label_element, has_press_recorded].
+        cal_recent_entries: list[list] = []
+        CAL_FEED_MAX = 8
+
+        def add_beat_entry() -> None:
+            with cal_feed:
+                lbl = ui.label("Press!").classes(
+                    "text-gray-600 dark:text-gray-300 leading-tight"
+                )
+            cal_recent_entries.append([lbl, False])
+            while len(cal_recent_entries) > CAL_FEED_MAX:
+                old_lbl, _ = cal_recent_entries.pop(0)
+                old_lbl.delete()
+            ui.run_javascript(
+                f'const el = document.getElementById("c{cal_feed.id}");'
+                f' if (el) el.scrollTop = el.scrollHeight;'
+            )
+
+        def record_press_in_feed(offset_s: float) -> None:
+            for entry in reversed(cal_recent_entries):
+                if not entry[1]:
+                    offset_ms = offset_s * 1000
+                    entry[0].text = f"Press!  ✓  +{offset_ms:.0f}ms"
+                    entry[0].classes(
+                        remove="text-gray-600 dark:text-gray-300",
+                        add="text-emerald-600 dark:text-emerald-400",
+                    )
+                    entry[1] = True
+                    return
+
+        def reset_feed() -> None:
+            for lbl, _ in cal_recent_entries:
+                lbl.delete()
+            cal_recent_entries.clear()
+
+        BEAT_INTERVAL = 60.0 / 100.0  # 100 BPM
+        STDDEV_THRESHOLD = 0.030       # 30 ms
+        WINDOW = 5
+
+        # 250ms flash hold — long enough that the Hue bulb's ~50ms WiFi
+        # transit doesn't eat the entire visible window.
+        FLASH_HOLD = 0.25
+        beat_count = 0
+
+        async def run_calibration_beats(mode: str) -> None:
+            nonlocal beat_count
+            beat_count = 0
+            flash_color = "#facc15" if mode == "audio" else "#38bdf8"  # yellow / blue
+            try:
+                while state.calibration_mode == mode:
+                    state.calibration_beat_t = time.monotonic()
+                    beat_count += 1
+                    if mode == "audio":
+                        # Rewind first — HTML5 <audio> won't replay a finished
+                        # clip without seeking to the start.
+                        click_audio.seek(0)
+                        click_audio.play()
                     else:
+                        if state.controller is not None:
+                            state.controller.set_color(255, 255, 255)
+                            logger.info("[calibrate] beat %d: light flash white", beat_count)
+                        else:
+                            logger.warning(
+                                "[calibrate] beat %d: no controller — light flash skipped",
+                                beat_count,
+                            )
+                    cal_indicator.style(f"color: {flash_color}")
+                    add_beat_entry()
+                    await asyncio.sleep(FLASH_HOLD)
+                    if mode == "light" and state.controller is not None:
                         state.controller.set_color(0, 0, 0)
+                    cal_indicator.style("color: #d1d5db")
+                    await asyncio.sleep(BEAT_INTERVAL - FLASH_HOLD)
+            except asyncio.CancelledError:
+                if mode == "light" and state.controller is not None:
+                    state.controller.set_color(0, 0, 0)
+                cal_indicator.style("color: #d1d5db")
+                raise
 
-            asyncio.create_task(_fire_light())
-            asyncio.create_task(
-                _flash_indicator(light_indicator, light_delay + hue_lat, "gold")
+        def update_calibration_status() -> None:
+            n = len(state.calibration_taps)
+            cal_taps_label.text = f"Taps: {min(n, WINDOW)}/{WINDOW}"
+            if n >= 2:
+                s = stdev(state.calibration_taps)
+                cal_stddev_label.text = f"stddev: {s * 1000:.0f}ms"
+            else:
+                cal_stddev_label.text = "stddev: —"
+            if n >= WINDOW:
+                s = stdev(state.calibration_taps[-WINDOW:])
+                if s < STDDEV_THRESHOLD:
+                    m = _mean(state.calibration_taps[-WINDOW:])
+                    state.calibration_pending = (state.calibration_mode, m)
+                    cal_result.text = f"Calibrated: {m * 1000:.0f}ms"
+                    cal_apply_btn.set_visibility(True)
+                    cal_status.text = "Press Apply to save, or Cancel to retry."
+                    # Stop the beat loop now that we've locked in.
+                    if state.calibration_task and not state.calibration_task.done():
+                        state.calibration_task.cancel()
+                    state.calibration_mode = None
+
+        async def start_calibration(mode: str) -> None:
+            await stop_effect()  # don't fight a running effect
+            state.calibration_mode = mode
+            state.calibration_taps = []
+            state.calibration_pending = None
+            reset_feed()
+            cal_title.text = f"Calibrate {mode}"
+            cal_status.text = (
+                "Tap SPACE on each beat. Locks in after 5 consistent taps."
             )
-            asyncio.create_task(_flash_indicator(sound_indicator, audio_lat, "#0a8"))
+            cal_taps_label.text = "Taps: 0/5"
+            cal_stddev_label.text = "stddev: —"
+            cal_result.text = ""
+            cal_apply_btn.set_visibility(False)
+            calibrate_dialog.open()
+            state.calibration_task = asyncio.create_task(run_calibration_beats(mode))
+
+        async def stop_calibration() -> None:
+            state.calibration_mode = None
+            if state.calibration_task and not state.calibration_task.done():
+                state.calibration_task.cancel()
+                try:
+                    await state.calibration_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            calibrate_dialog.close()
+
+        async def on_cal_cancel() -> None:
+            state.calibration_pending = None
+            await stop_calibration()
+
+        async def on_cal_apply() -> None:
+            if state.calibration_pending is None:
+                await stop_calibration()
+                return
+            mode, mean_s = state.calibration_pending
+            mean_ms = mean_s * 1000
+            if mode == "audio":
+                state.audio_latency_override_s = mean_s
+                audio_override_input.value = round(mean_ms)
+            else:
+                state.hue_latency_override_s = mean_s
+                hue_override_input.value = round(mean_ms)
+            save_prefs()
+            ui.notify(f"{mode.title()} latency calibrated: {mean_ms:.0f}ms")
+            logger.info(
+                "[calibrate] %s mean=%.3fs (%d taps)", mode, mean_s,
+                len(state.calibration_taps),
+            )
+            state.calibration_pending = None
+            await stop_calibration()
+
+        cal_cancel_btn.on_click(on_cal_cancel)
+        cal_apply_btn.on_click(on_cal_apply)
+        calibrate_dialog.on("hide", lambda _e: asyncio.create_task(on_cal_cancel())
+                            if state.calibration_mode is not None else None)
+
+        def register_tap() -> None:
+            """Record a tap. Called by both the Tap button and the keyboard
+            handler — single source of truth for the tap-recording logic."""
+            if state.calibration_mode is None:
+                return
+            now = time.monotonic()
+            offset = now - state.calibration_beat_t
+            # Reject obvious mis-taps (negative or > beat interval — likely
+            # tapping to a different beat than the most recent dispatch).
+            if offset <= 0 or offset > BEAT_INTERVAL:
+                return
+            state.calibration_taps.append(offset)
+            if len(state.calibration_taps) > WINDOW:
+                state.calibration_taps = state.calibration_taps[-WINDOW:]
+            record_press_in_feed(offset)
+            update_calibration_status()
+
+        def on_tap_click() -> None:
+            register_tap()
+            # Blur so a follow-up Enter keypress doesn't synthetic-click the
+            # button AND hit the keyboard handler (would double-tap).
+            ui.run_javascript(
+                "if (document.activeElement) document.activeElement.blur();"
+            )
+
+        cal_tap_btn.on_click(on_tap_click)
+
+        def on_keydown(e) -> None:
+            if state.calibration_mode is None:
+                return
+            if not e.action.keydown:
+                return
+            # Enter is the primary keyboard alternative; space kept as
+            # bonus (may be intercepted by macOS in some webview contexts).
+            if e.key.name in (" ", "Enter"):
+                register_tap()
+
+        ui.keyboard(on_key=on_keydown)
 
         # ── SPOTIFY VOLUME ───────────────────────────────────────────
         ui.label("Spotify volume").classes(_hdr_break)

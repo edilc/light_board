@@ -21,6 +21,11 @@ DEFAULTS: dict[str, Any] = {
     "night_target_volume": 100,
     "internal_audio_volume": 1.0,
     "dark_mode": False,
+    # Calibration results from the spacebar-tap calibration. None means
+    # "use the auto-detected/assumed value" (audio: AudioContext.outputLatency;
+    # hue: HUE_LATENCY_S constant).
+    "audio_latency_override_ms": None,
+    "hue_latency_override_ms": None,
 }
 
 
