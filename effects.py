@@ -222,7 +222,8 @@ async def lightning_effect(
     channels flash max-white, then ease back down to their (still
     quivering) base color. After the audio, settles to BRIGHT_WHITE.
 
-    Strike times are from peak waveform amplitude analysis of thunder.wav."""
+    Strike times are the leading edges of each high-frequency cluster in
+    thunder.wav (the HF-flux "Edge" detection method)."""
     clock = _resolve_clock(clock)
     a = get_thunder()
 
@@ -232,13 +233,18 @@ async def lightning_effect(
         (80, 20, 110),    # ch2: violet
     ]
     WHITE = (255, 255, 255)
-    STRIKES = [0.300, 0.900]
+    STRIKES = [0.046, 0.580]
 
     FLASH_DUR = 0.08
     FADE_DUR = 0.30
     SETTLE_DUR = 2.0
 
-    settle_start = a.duration
+    # Don't begin the settle ramp until the last strike has had time to
+    # fully flash AND fade back to its base color — otherwise a strike
+    # near the file's end (e.g. 8.034s of an 8.19s clip) gets visually
+    # eaten by the settle's lerp to BRIGHT_WHITE.
+    last_strike = max(STRIKES) if STRIKES else 0.0
+    settle_start = max(a.duration, last_strike + FLASH_DUR + FADE_DUR + 0.1)
     duration = settle_start + SETTLE_DUR
 
     def quiver_factor(t: float) -> float:

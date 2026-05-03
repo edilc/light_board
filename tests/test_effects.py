@@ -179,7 +179,7 @@ async def test_lightning():
     _print_trace("lightning", rec, every=120)
 
     # Each strike should produce a max-white frame on all 3 channels within ~0.1s.
-    STRIKES = [0.300, 0.900]
+    STRIKES = [0.046, 0.580]
     for strike_t in STRIKES:
         white_frames = [
             (t, snap)
@@ -188,13 +188,13 @@ async def test_lightning():
         ]
         assert white_frames, f"no max-white frame within 150ms of strike at {strike_t}s"
 
-    # In-between (after first strike fade ends, before second strike): channels
-    # must show distinct shades — not uniform — and brightness must vary
+    # In-between (after both strikes' fades, before settle): channels must
+    # show distinct shades — not uniform — and brightness must vary
     # (the RMS-driven quiver).
     in_between = [
         (t, snap)
         for t, snap in rec.events
-        if 0.7 < t < 0.85
+        if 2.0 < t < 4.0
     ]
     assert in_between, "no frames captured in the in-between window"
     # Channels are distinct (different blue/purple shades).
