@@ -1,0 +1,24 @@
+[project]
+name = "light-board"
+version = "0.1.0"
+description = "Minimal NiceGUI dashboard for low-latency Philips Hue control."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "nicegui>=2.10",
+    "hue-entertainment-pykit",
+    "librosa>=0.11.0",
+    "pywebview>=6.2.1",
+]
+
+[tool.uv.sources]
+hue-entertainment-pykit = { path = "../hue-entertainment-pykit", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
