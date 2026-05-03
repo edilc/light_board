@@ -6,7 +6,7 @@ from statistics import mean as _mean, stdev
 from pathlib import Path
 from typing import Optional
 
-from nicegui import app, ui
+from nicegui import app, background_tasks, ui
 
 from hue_entertainment_pykit import setup_logs
 
@@ -62,6 +62,26 @@ logging.getLogger("hue_entertainment_pykit.services.streaming_service").setLevel
 SOUNDS_DIR = Path(__file__).parent / "sounds"
 app.add_static_files("/sounds", str(SOUNDS_DIR))
 
+# Swallow the default action of space when nothing editable is focused.
+# Otherwise WKWebView (and macOS in general) emits the system "donk" on
+# every space tap during calibration because no element accepts the
+# keystroke. Capture phase so we beat any other listeners. The Python
+# `ui.keyboard` handler still runs — it goes through `on('key')` which
+# isn't the keystroke's default action, so preventing default doesn't
+# block our tap-recording.
+ui.add_head_html("""
+<script>
+document.addEventListener('keydown', (e) => {
+    if (e.key !== ' ') return;
+    const el = document.activeElement;
+    const tag = (el && el.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+    if (el && el.isContentEditable) return;
+    e.preventDefault();
+}, true);
+</script>
+""", shared=True)
+
 # Approximate latency from `streaming.set_input(...)` to the bulb actually
 # changing color over WiFi+DTLS. Detecting it precisely would require
 # timing something visible at the bulb itself, so we assume a fixed value.
@@ -101,7 +121,7 @@ class AppState:
     calibration_mode: Optional[str] = None
     calibration_taps: list = field(default_factory=list)
     calibration_beat_t: float = 0.0
-    calibration_task: Optional[asyncio.Task] = None
+    calibration_beat_count: int = 0
     calibration_pending: Optional[tuple] = None  # (mode, mean_seconds) when locked in
 
 
@@ -567,7 +587,7 @@ def home() -> None:
             ).classes("flex-1")
             ui.button(
                 "Calibrate", icon="straighten",
-                on_click=lambda: asyncio.create_task(start_calibration("audio")),
+                on_click=lambda: start_calibration("audio"),
             ).props("size=sm color=primary")
         ui.label(f"Hue assumed: {HUE_LATENCY_S * 1000:.0f}ms").classes(_sub + " mt-1")
         with ui.row().classes("items-center gap-2 w-full"):
@@ -579,7 +599,7 @@ def home() -> None:
             ).classes("flex-1")
             ui.button(
                 "Calibrate", icon="straighten",
-                on_click=lambda: asyncio.create_task(start_calibration("light")),
+                on_click=lambda: start_calibration("light"),
             ).props("size=sm color=primary")
 
         click_audio = (
@@ -602,7 +622,9 @@ def home() -> None:
         # ── Calibration dialog ──────────────────────────────────────
         with ui.dialog() as calibrate_dialog, ui.card().classes("gap-2 items-center w-96"):
             cal_title = ui.label("Calibrate").classes("text-base font-semibold")
-            cal_indicator = ui.icon("circle").classes("text-6xl transition-colors").style(
+            # No transition-colors — we want the indicator to flash crisply
+            # in lockstep with the audio click / light pulse.
+            cal_indicator = ui.icon("circle").classes("text-6xl").style(
                 "color: #d1d5db"
             )
             cal_tap_btn = (
@@ -670,46 +692,50 @@ def home() -> None:
         BEAT_INTERVAL = 60.0 / 100.0  # 100 BPM
         STDDEV_THRESHOLD = 0.030       # 30 ms
         WINDOW = 5
-
         # 250ms flash hold — long enough that the Hue bulb's ~50ms WiFi
         # transit doesn't eat the entire visible window.
         FLASH_HOLD = 0.25
-        beat_count = 0
 
-        async def run_calibration_beats(mode: str) -> None:
-            nonlocal beat_count
-            beat_count = 0
-            flash_color = "#facc15" if mode == "audio" else "#38bdf8"  # yellow / blue
-            try:
-                while state.calibration_mode == mode:
-                    state.calibration_beat_t = time.monotonic()
-                    beat_count += 1
-                    if mode == "audio":
-                        # Rewind first — HTML5 <audio> won't replay a finished
-                        # clip without seeking to the start.
-                        click_audio.seek(0)
-                        click_audio.play()
-                    else:
-                        if state.controller is not None:
-                            state.controller.set_color(255, 255, 255)
-                            logger.info("[calibrate] beat %d: light flash white", beat_count)
-                        else:
-                            logger.warning(
-                                "[calibrate] beat %d: no controller — light flash skipped",
-                                beat_count,
-                            )
-                    cal_indicator.style(f"color: {flash_color}")
-                    add_beat_entry()
-                    await asyncio.sleep(FLASH_HOLD)
-                    if mode == "light" and state.controller is not None:
-                        state.controller.set_color(0, 0, 0)
-                    cal_indicator.style("color: #d1d5db")
-                    await asyncio.sleep(BEAT_INTERVAL - FLASH_HOLD)
-            except asyncio.CancelledError:
-                if mode == "light" and state.controller is not None:
-                    state.controller.set_color(0, 0, 0)
-                cal_indicator.style("color: #d1d5db")
-                raise
+        FLASH_COLORS = {"audio": "#facc15", "light": "#38bdf8"}  # yellow / blue
+
+        # The metronome runs as a `ui.timer` rather than an asyncio task.
+        # The previous design used `asyncio.create_task(loop)` and died after
+        # one iteration — exceptions in the loop were swallowed by the task,
+        # and the dialog's `hide` handler could flip `calibration_mode` to
+        # None before the second beat. ui.timer runs in the page's UI
+        # context, surfaces errors, and is start/stoppable as a unit.
+        def beat_tick() -> None:
+            mode = state.calibration_mode
+            if mode is None:
+                return
+            state.calibration_beat_count += 1
+            state.calibration_beat_t = time.monotonic()
+            if mode == "audio":
+                # HTML5 <audio> won't replay a finished clip without seeking
+                # to the start first.
+                click_audio.seek(0)
+                click_audio.play()
+            elif mode == "light":
+                if state.controller is not None:
+                    state.controller.set_color(255, 255, 255)
+                    logger.info(
+                        "[calibrate] beat %d: light on", state.calibration_beat_count
+                    )
+                else:
+                    logger.warning(
+                        "[calibrate] beat %d: no controller — flash skipped",
+                        state.calibration_beat_count,
+                    )
+            cal_indicator.style(f"color: {FLASH_COLORS[mode]}")
+            add_beat_entry()
+            ui.timer(FLASH_HOLD, beat_reset, once=True)
+
+        def beat_reset() -> None:
+            if state.calibration_mode == "light" and state.controller is not None:
+                state.controller.set_color(0, 0, 0)
+            cal_indicator.style("color: #d1d5db")
+
+        beat_timer = ui.timer(BEAT_INTERVAL, beat_tick, active=False)
 
         def update_calibration_status() -> None:
             n = len(state.calibration_taps)
@@ -722,50 +748,55 @@ def home() -> None:
             if n >= WINDOW:
                 s = stdev(state.calibration_taps[-WINDOW:])
                 if s < STDDEV_THRESHOLD:
-                    m = _mean(state.calibration_taps[-WINDOW:])
+                    # Floor at 0: a negative signed offset means the user is
+                    # anticipating the beat faster than the actual latency,
+                    # which is real but doesn't translate to a meaningful
+                    # "latency" value. Treat it as "≈0ms latency".
+                    m = max(0.0, _mean(state.calibration_taps[-WINDOW:]))
                     state.calibration_pending = (state.calibration_mode, m)
                     cal_result.text = f"Calibrated: {m * 1000:.0f}ms"
                     cal_apply_btn.set_visibility(True)
                     cal_status.text = "Press Apply to save, or Cancel to retry."
-                    # Stop the beat loop now that we've locked in.
-                    if state.calibration_task and not state.calibration_task.done():
-                        state.calibration_task.cancel()
+                    # Stop the metronome now that we've locked in.
+                    beat_timer.deactivate()
                     state.calibration_mode = None
 
-        async def start_calibration(mode: str) -> None:
-            await stop_effect()  # don't fight a running effect
+        def stop_calibration() -> None:
+            state.calibration_mode = None
+            beat_timer.deactivate()
+            if state.controller is not None:
+                # Make sure the bulb isn't left on if we cancel mid-flash.
+                state.controller.set_color(0, 0, 0)
+            cal_indicator.style("color: #d1d5db")
+            calibrate_dialog.close()
+
+        def start_calibration(mode: str) -> None:
+            background_tasks.create(stop_effect(), name="calibration-stop-effect")
             state.calibration_mode = mode
             state.calibration_taps = []
             state.calibration_pending = None
+            state.calibration_beat_count = 0
+            state.calibration_beat_t = 0.0
             reset_feed()
             cal_title.text = f"Calibrate {mode}"
-            cal_status.text = (
-                "Tap SPACE on each beat. Locks in after 5 consistent taps."
-            )
+            cal_status.text = "Tap SPACE on each beat. Locks in after 5 consistent taps."
             cal_taps_label.text = "Taps: 0/5"
             cal_stddev_label.text = "stddev: —"
             cal_result.text = ""
             cal_apply_btn.set_visibility(False)
             calibrate_dialog.open()
-            state.calibration_task = asyncio.create_task(run_calibration_beats(mode))
+            # Fire the first beat immediately so the user doesn't wait 600ms
+            # staring at a silent dialog.
+            beat_tick()
+            beat_timer.activate()
 
-        async def stop_calibration() -> None:
-            state.calibration_mode = None
-            if state.calibration_task and not state.calibration_task.done():
-                state.calibration_task.cancel()
-                try:
-                    await state.calibration_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            calibrate_dialog.close()
-
-        async def on_cal_cancel() -> None:
+        def on_cal_cancel() -> None:
             state.calibration_pending = None
-            await stop_calibration()
+            stop_calibration()
 
-        async def on_cal_apply() -> None:
+        def on_cal_apply() -> None:
             if state.calibration_pending is None:
-                await stop_calibration()
+                stop_calibration()
                 return
             mode, mean_s = state.calibration_pending
             mean_ms = mean_s * 1000
@@ -782,23 +813,32 @@ def home() -> None:
                 len(state.calibration_taps),
             )
             state.calibration_pending = None
-            await stop_calibration()
+            stop_calibration()
 
         cal_cancel_btn.on_click(on_cal_cancel)
         cal_apply_btn.on_click(on_cal_apply)
-        calibrate_dialog.on("hide", lambda _e: asyncio.create_task(on_cal_cancel())
-                            if state.calibration_mode is not None else None)
+        # Only treat a `hide` event as a cancel if we're actually mid-session.
+        # Without this guard a spurious early hide (e.g. Quasar settling
+        # initial state) would flip calibration_mode to None and kill the
+        # metronome after one beat.
+        calibrate_dialog.on(
+            "hide",
+            lambda _e: on_cal_cancel() if state.calibration_mode is not None else None,
+        )
 
         def register_tap() -> None:
             """Record a tap. Called by both the Tap button and the keyboard
             handler — single source of truth for the tap-recording logic."""
-            if state.calibration_mode is None:
+            if state.calibration_mode is None or state.calibration_beat_t == 0.0:
                 return
-            now = time.monotonic()
-            offset = now - state.calibration_beat_t
-            # Reject obvious mis-taps (negative or > beat interval — likely
-            # tapping to a different beat than the most recent dispatch).
-            if offset <= 0 or offset > BEAT_INTERVAL:
+            raw = time.monotonic() - state.calibration_beat_t
+            # Map to nearest beat: a tap that lands in the second half of
+            # the interval is treated as anticipating the *next* beat (signed
+            # negative). This lets users who tap slightly early — or who
+            # have a fast auditory reaction — still get counted instead of
+            # silently dropped as in the old `offset <= 0` reject.
+            offset = raw if raw < BEAT_INTERVAL / 2 else raw - BEAT_INTERVAL
+            if abs(offset) > BEAT_INTERVAL / 2:
                 return
             state.calibration_taps.append(offset)
             if len(state.calibration_taps) > WINDOW:
