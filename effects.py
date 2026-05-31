@@ -72,8 +72,8 @@ async def _settle_to_bright_white(
     """Lerp from `ctl.last_colors` into `config.bright_white` over
     `duration`. Reads `config.bright_white` on every frame so a
     mid-effect dashboard update shifts the destination on the fly."""
-    start_colors = list(ctl.last_colors[:3])
-    while len(start_colors) < 3:
+    start_colors = list(ctl.last_colors[:4])
+    while len(start_colors) < 4:
         start_colors.append(config.bright_white)
 
     def frame(t: float):
@@ -155,6 +155,7 @@ async def lightning_effect(
         (10, 30, 110),    # ch0: deep blue
         (40, 15, 120),    # ch1: indigo
         (80, 20, 110),    # ch2: violet
+        (10, 30, 110),    # ch3: mirrors ch0 (new light)
     ]
     WHITE = (255, 255, 255)
     STRIKES = [0.046, 0.580]
@@ -179,9 +180,9 @@ async def lightning_effect(
         if recent is not None and t - recent < FLASH_DUR + FADE_DUR:
             d = t - recent
             if d < FLASH_DUR:
-                return [WHITE, WHITE, WHITE]
+                return [WHITE] * 4
             f = quadratic_in((d - FLASH_DUR) / FADE_DUR)
-            return [lerp(WHITE, base[ch], f) for ch in range(3)]
+            return [lerp(WHITE, base[ch], f) for ch in range(4)]
         return base
 
     await frame_loop(ctl, clock, main_duration, frame)
@@ -261,15 +262,17 @@ async def night_effect(
         scale((0, 100, 255), 0.2),     # ch0 blue
         scale((140, 70, 220), 0.2),    # ch1 purple
         scale((40, 80, 200), 0.2),     # ch2 dark blue
+        scale((0, 100, 255), 0.2),     # ch3 mirrors ch0 (new light)
     ]
     p2_bases = [
         scale((0, 100, 255), 0.6),     # ch0 blue
         scale((140, 70, 220), 0.6),    # ch1 purple
         scale((255, 110, 20), 0.6),    # ch2 orange
+        scale((0, 100, 255), 0.6),     # ch3 mirrors ch0 (new light)
     ]
 
-    start_colors = list(ctl.last_colors[:3])
-    while len(start_colors) < 3:
+    start_colors = list(ctl.last_colors[:4])
+    while len(start_colors) < 4:
         start_colors.append(config.bright_white)
 
     # Volume choreography runs concurrent with phase 1+2 so the music
@@ -290,14 +293,14 @@ async def night_effect(
     try:
         def phase1(t: float):
             f = smoothstep(t / P1_DUR)
-            return [lerp(start_colors[ch], p1_targets[ch], f) for ch in range(3)]
+            return [lerp(start_colors[ch], p1_targets[ch], f) for ch in range(4)]
 
         await frame_loop(ctl, clock, P1_DUR, phase1)
 
         def phase2(t: float):
             f = smoothstep(t / P2_DUR)
             snap = []
-            for ch in range(3):
+            for ch in range(4):
                 base = lerp(p1_targets[ch], p2_bases[ch], f)
                 if ch == 2:
                     # Use absolute time for candle so the waveform is
@@ -316,7 +319,7 @@ async def night_effect(
         def phase3(t: float):
             absolute_t = t + P1_DUR + P2_DUR
             snap = []
-            for ch in range(3):
+            for ch in range(4):
                 if ch == 2:
                     cf = candle(absolute_t, ch)
                     snap.append(scale(p2_bases[ch], cf))
@@ -472,6 +475,7 @@ async def _victory_effect(
                 elif d < _FW_FLASH_DUR + _FW_FADE_DUR:
                     f = quadratic_in((d - _FW_FLASH_DUR) / _FW_FADE_DUR)
                     ch_colors[ch] = lerp(color, bg_dim, f)
+            ch_colors.append(ch_colors[0])  # ch3 mirrors ch0 (new light)
             return ch_colors
 
         # Tail phase — same as the v2 trial: lift to full accent, hold
@@ -480,8 +484,8 @@ async def _victory_effect(
         target = _tail_color(accent, env, t)
         if d < _TAIL_LIFT_DUR:
             f = smoothstep(d / _TAIL_LIFT_DUR)
-            return [lerp(bg_dim, target, f) for _ in range(3)]
-        return [target, target, target]
+            return [lerp(bg_dim, target, f) for _ in range(4)]
+        return [target] * 4
 
     await frame_loop(ctl, clock, main_duration, frame)
     await _settle_to_bright_white(ctl, config, clock, duration=_VICTORY_SETTLE_DUR)
