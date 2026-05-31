@@ -1,4 +1,5 @@
 import asyncio
+import colorsys
 import inspect
 import logging
 import time
@@ -529,13 +530,21 @@ def home() -> None:
         b_slider = ui.slider(min=0, max=255, value=0).props("label-always color=blue")
         bri_slider = ui.slider(min=0, max=100, value=100).props("label-always")
 
+        def manual_rgb() -> tuple[int, int, int]:
+            """Combine the R/G/B sliders (hue + saturation) with the
+            brightness slider (the V in HSV) into the color the lights
+            should show. Brightness scales the chosen color's level
+            independently, so it can both brighten and dim it."""
+            h, s, _ = colorsys.rgb_to_hsv(
+                r_slider.value / 255, g_slider.value / 255, b_slider.value / 255
+            )
+            fr, fg, fb = colorsys.hsv_to_rgb(h, s, bri_slider.value / 100)
+            return round(fr * 255), round(fg * 255), round(fb * 255)
+
         def push_manual_color() -> None:
             if not state.manual_override_active or state.controller is None:
                 return
-            bri = bri_slider.value / 100
-            r = max(0, min(255, int(r_slider.value * bri)))
-            g = max(0, min(255, int(g_slider.value * bri)))
-            b = max(0, min(255, int(b_slider.value * bri)))
+            r, g, b = manual_rgb()
             ch = channel_toggle.value
             if ch == "All":
                 state.controller.set_color(r, g, b)
@@ -575,9 +584,15 @@ def home() -> None:
                     idx = 0
             if idx < len(state.controller.last_colors):
                 cr, cg, cb = state.controller.last_colors[idx]
-                r_slider.value = cr
-                g_slider.value = cg
-                b_slider.value = cb
+                # Split the live color back into the same representation
+                # push uses: hue+saturation at full value in the R/G/B
+                # sliders, level in the brightness slider.
+                h, s, v = colorsys.rgb_to_hsv(cr / 255, cg / 255, cb / 255)
+                fr, fg, fb = colorsys.hsv_to_rgb(h, s, 1.0)
+                r_slider.value = round(fr * 255)
+                g_slider.value = round(fg * 255)
+                b_slider.value = round(fb * 255)
+                bri_slider.value = round(v * 100)
 
         ui.timer(0.5, sync_sliders_from_state)
 
@@ -585,10 +600,7 @@ def home() -> None:
             """Snapshot the current manual-color slider state into
             `config.bright_white` and persist it. The new value applies to
             morning/rooster/gong/gavel on their next run."""
-            bri = bri_slider.value / 100
-            r = max(0, min(255, int(r_slider.value * bri)))
-            g = max(0, min(255, int(g_slider.value * bri)))
-            b = max(0, min(255, int(b_slider.value * bri)))
+            r, g, b = manual_rgb()
             config.update(bright_white=(r, g, b))
             ui.notify(f"Day target saved: ({r}, {g}, {b})")
 
