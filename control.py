@@ -177,17 +177,19 @@ class RecordingVolumeController:
         self.events.append((self._clock.now(), int(percent)))
 
 
-# DTLS handshake hangs roughly half the time on this network — succeeds
-# in ~600ms when it works, hangs forever when it doesn't. We retry with
-# progressively longer per-attempt budgets so a fresh socket gets a
-# chance, and the eventual happy attempt isn't capped by an aggressive
-# timeout.
+# The DTLS handshake hangs roughly half the time on this network —
+# succeeds in ~600ms when it works, hangs forever when it doesn't.
+# Discovery and entertainment-config selection are fast and reliable, so we
+# do them once up front and retry only `start_stream` (the PUT + handshake)
+# with progressively longer per-attempt budgets, each on a fresh socket.
 _CONNECT_TIMEOUTS_S: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
 
 
-def _do_connect() -> HueController:
-    """Discover bridge → entertainment area → start streaming. Blocking;
-    no timeout, no retry. Wrapped by `connect()`."""
+def _discover() -> tuple[Bridge, Entertainment, EntertainmentConfiguration]:
+    """Discover the first bridge and pick its first entertainment area.
+    Blocking but reliable — no DTLS handshake here, so it's run once and not
+    retried for timeouts. Raises if there's no bridge or no entertainment
+    area (those surface immediately rather than being retried)."""
     bridges = Discovery().discover_bridges()
     if not bridges:
         raise RuntimeError("No Hue bridge found on the network.")
@@ -199,47 +201,72 @@ def _do_connect() -> HueController:
         raise RuntimeError("Bridge has no entertainment areas configured.")
 
     config = next(iter(configs.values()))
-    streaming = Streaming(bridge, config, entertainment.get_ent_conf_repo())
-    streaming.start_stream()
-    streaming.set_color_space("rgb")
-
-    channel_ids = [ch.channel_id for ch in config.channels]
-    return HueController(bridge, entertainment, streaming, config, channel_ids)
+    return bridge, entertainment, config
 
 
-def _connect_with_timeout(timeout_s: float) -> HueController:
-    """Run `_do_connect` in a daemon thread; raise TimeoutError if it
-    doesn't finish in `timeout_s`. Python can't safely kill a thread, so
-    a hung handshake leaks the worker — daemon=True ensures process exit
-    still cleans it up, and the next attempt starts with a fresh socket."""
-    result: list[HueController] = []
+def _safe_stop(streaming: Streaming) -> None:
+    """Best-effort teardown of a streaming session; never raises."""
+    try:
+        streaming.stop_stream()
+    except Exception:
+        logger.warning("failed to tear down abandoned Hue stream", exc_info=True)
+
+
+def _start_stream_with_timeout(streaming: Streaming, timeout_s: float) -> None:
+    """Run `streaming.start_stream()` (PUT + DTLS handshake) in a daemon
+    thread; raise TimeoutError if it doesn't finish in `timeout_s`.
+
+    Python can't safely kill a thread, so a hung handshake leaks the worker.
+    The Hue bridge allows only one active entertainment stream, so a worker
+    that completes *after* its attempt timed out would hold that single slot
+    and hang every later attempt. We flag such a worker abandoned and have it
+    tear its own just-opened session down once the handshake finally returns.
+
+    A `finished` event guarded by a lock closes the boundary race: if the
+    worker completes at the same instant we time out, whichever side takes
+    the lock first wins — we either adopt the just-finished session (we see
+    `finished` set) or the worker sees `abandoned` set and stops the stream."""
     err: list[BaseException] = []
+    finished = threading.Event()
+    lock = threading.Lock()
+    abandoned = False
 
     def worker() -> None:
+        nonlocal abandoned
         try:
-            result.append(_do_connect())
+            streaming.start_stream()
         except BaseException as e:
-            # Forward everything (incl. KeyboardInterrupt) to the joining
-            # thread; this worker is the sole consumer of the exception.
-            err.append(e)
+            # Forward everything (incl. KeyboardInterrupt) to the caller.
+            with lock:
+                err.append(e)
+                finished.set()
+            return
+        with lock:
+            finished.set()
+            if abandoned:
+                _safe_stop(streaming)
 
-    t = threading.Thread(target=worker, name="hue-connect", daemon=True)
+    t = threading.Thread(target=worker, name="hue-start-stream", daemon=True)
     t.start()
-    t.join(timeout_s)
-    if t.is_alive():
-        raise TimeoutError(f"Hue connect hung past {timeout_s:.1f}s")
-    if err:
-        raise err[0]
-    return result[0]
+    finished.wait(timeout_s)
+    with lock:
+        if not finished.is_set():
+            abandoned = True
+            raise TimeoutError(f"Hue handshake hung past {timeout_s:.1f}s")
+        if err:
+            raise err[0]
 
 
 def connect() -> HueController:
     """Discover the first bridge, pick the first entertainment area, start
     streaming, and return a controller. Blocking — call from a thread.
 
-    Retries on TimeoutError (the DTLS handshake hanging) with the
-    `_CONNECT_TIMEOUTS_S` budgets — 1s, 2s, 4s, 8s. Other errors (no
-    bridge found, no entertainment area) surface immediately."""
+    Discovery + area selection happen once; only `start_stream` (the DTLS
+    handshake that hangs) is retried, with the `_CONNECT_TIMEOUTS_S` budgets
+    — 1s, 2s, 4s, 8s — each on a fresh `Streaming`/socket. Non-timeout
+    errors (no bridge, no entertainment area) surface immediately."""
+    bridge, entertainment, config = _discover()
+
     for attempt in Retrying(
         stop=stop_after_attempt(len(_CONNECT_TIMEOUTS_S)),
         wait=wait_fixed(0.3),
@@ -253,10 +280,16 @@ def connect() -> HueController:
                 "connect attempt %d/%d (timeout=%.1fs)",
                 i + 1, len(_CONNECT_TIMEOUTS_S), timeout,
             )
+            # Fresh Streaming each attempt: a timed-out attempt's worker may
+            # still own its old socket, so the retry must not reuse it.
+            streaming = Streaming(bridge, config, entertainment.get_ent_conf_repo())
             try:
-                return _connect_with_timeout(timeout)
+                _start_stream_with_timeout(streaming, timeout)
             except TimeoutError as e:
                 logger.warning("connect attempt %d/%d timed out: %s",
                                i + 1, len(_CONNECT_TIMEOUTS_S), e)
                 raise
+            streaming.set_color_space("rgb")
+            channel_ids = [ch.channel_id for ch in config.channels]
+            return HueController(bridge, entertainment, streaming, config, channel_ids)
     raise RuntimeError("unreachable: Retrying with reraise=True must raise on exhaustion")
