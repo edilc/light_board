@@ -86,7 +86,7 @@ def test_turn_off_light_posts_to_home_assistant(monkeypatch: pytest.MonkeyPatch)
     assert response.raise_called is True
 
 
-def test_turn_on_light_clamps_brightness(monkeypatch: pytest.MonkeyPatch):
+def test_turn_on_light_clamps_brightness_pct(monkeypatch: pytest.MonkeyPatch):
     calls = []
     response = FakeResponse()
 
@@ -102,6 +102,45 @@ def test_turn_on_light_clamps_brightness(monkeypatch: pytest.MonkeyPatch):
     )
 
     assert calls[0][1]["json"]["brightness_pct"] == 100
+
+
+def test_turn_on_light_supports_raw_brightness(monkeypatch: pytest.MonkeyPatch):
+    calls = []
+    response = FakeResponse()
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        return response
+
+    monkeypatch.setattr("home_assistant.requests.post", fake_post)
+
+    HomeAssistantClient(url="http://t460s:8123", token="secret").turn_on_light(
+        "light.dining_room_brighter",
+        brightness=1,
+    )
+
+    assert calls[0][1]["json"] == {
+        "entity_id": "light.dining_room_brighter",
+        "brightness": 1,
+    }
+
+
+def test_turn_on_light_clamps_raw_brightness(monkeypatch: pytest.MonkeyPatch):
+    calls = []
+    response = FakeResponse()
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        return response
+
+    monkeypatch.setattr("home_assistant.requests.post", fake_post)
+
+    HomeAssistantClient(url="http://t460s:8123", token="secret").turn_on_light(
+        "light.dining_room_brighter",
+        brightness=0,
+    )
+
+    assert calls[0][1]["json"]["brightness"] == 1
 
 
 def test_turn_on_light_skips_without_token(monkeypatch: pytest.MonkeyPatch):

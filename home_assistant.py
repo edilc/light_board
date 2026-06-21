@@ -53,9 +53,17 @@ class HomeAssistantClient:
         response.raise_for_status()
         logger.info("home assistant light %s: %s", service, entity_id)
 
-    def turn_on_light(self, entity_id: str, *, brightness_pct: int | None = None) -> None:
+    def turn_on_light(
+        self,
+        entity_id: str,
+        *,
+        brightness_pct: int | None = None,
+        brightness: int | None = None,
+    ) -> None:
         payload: dict = {"entity_id": entity_id}
-        if brightness_pct is not None:
+        if brightness is not None:
+            payload["brightness"] = max(1, min(255, int(brightness)))
+        elif brightness_pct is not None:
             payload["brightness_pct"] = max(0, min(100, int(brightness_pct)))
         self._call_light_service("turn_on", payload)
 
@@ -63,10 +71,17 @@ class HomeAssistantClient:
         self._call_light_service("turn_off", {"entity_id": entity_id})
 
     async def turn_on_light_async(
-        self, entity_id: str, *, brightness_pct: int | None = None
+        self,
+        entity_id: str,
+        *,
+        brightness_pct: int | None = None,
+        brightness: int | None = None,
     ) -> None:
         await asyncio.to_thread(
-            self.turn_on_light, entity_id, brightness_pct=brightness_pct
+            self.turn_on_light,
+            entity_id,
+            brightness_pct=brightness_pct,
+            brightness=brightness,
         )
 
     async def turn_off_light_async(self, entity_id: str) -> None:

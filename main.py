@@ -288,7 +288,8 @@ def home() -> None:
         )
 
         async def fade_brighter(kind: str, *, enabled: bool) -> None:
-            target = max(0, min(100, int(config.home_assistant_brighter_day_brightness_pct)))
+            target_pct = max(0, min(100, int(config.home_assistant_brighter_day_brightness_pct)))
+            target = max(1, round(target_pct * 255 / 100))
             duration = max(0.0, float(config.home_assistant_brighter_fade_seconds))
             decay = max(0.01, min(0.99, float(config.home_assistant_brighter_fade_decay_per_second)))
             interval = 0.1
@@ -297,7 +298,7 @@ def home() -> None:
                 if enabled:
                     await state.home_assistant.turn_on_light_async(
                         config.home_assistant_brighter_entity,
-                        brightness_pct=1,
+                        brightness=1,
                     )
                 for i in range(steps + 1):
                     elapsed = min(duration, i * interval)
@@ -316,14 +317,14 @@ def home() -> None:
                     if enabled or brightness > 1:
                         await state.home_assistant.turn_on_light_async(
                             config.home_assistant_brighter_entity,
-                            brightness_pct=brightness,
+                            brightness=brightness,
                         )
                     if i < steps:
                         await asyncio.sleep(interval)
                 if enabled:
                     await state.home_assistant.turn_on_light_async(
                         config.home_assistant_brighter_entity,
-                        brightness_pct=target,
+                        brightness=target,
                     )
                 else:
                     await state.home_assistant.turn_off_light_async(
