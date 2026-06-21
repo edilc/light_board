@@ -82,6 +82,11 @@ class TestSave:
             night_target_volume=66,
             internal_audio_volume=0.42,
             dark_mode=True,
+            home_assistant_url="http://t460s:8123",
+            home_assistant_brighter_entity="light.custom_brighter",
+            home_assistant_brighter_day_brightness_pct=42,
+            home_assistant_brighter_fade_seconds=7.5,
+            home_assistant_brighter_fade_decay_per_second=0.6,
             audio_latency_override_ms=150,
             hue_latency_override_ms=80,
         )
@@ -93,6 +98,11 @@ class TestSave:
         assert reloaded.night_target_volume == 66
         assert reloaded.internal_audio_volume == 0.42
         assert reloaded.dark_mode is True
+        assert reloaded.home_assistant_url == "http://t460s:8123"
+        assert reloaded.home_assistant_brighter_entity == "light.custom_brighter"
+        assert reloaded.home_assistant_brighter_day_brightness_pct == 42
+        assert reloaded.home_assistant_brighter_fade_seconds == 7.5
+        assert reloaded.home_assistant_brighter_fade_decay_per_second == 0.6
         assert reloaded.audio_latency_override_ms == 150
         assert reloaded.hue_latency_override_ms == 80
 

@@ -5,14 +5,12 @@ description = "Minimal NiceGUI dashboard for low-latency Philips Hue control."
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "nicegui>=2.10",
-    "hue-entertainment-pykit",
+    "hue-entertainment-pykit==0.9.4",
     "librosa>=0.11.0",
     "pywebview>=6.2.1",
+    "requests>=2.32.5",
     "tenacity>=9.1.4",
 ]
-
-[tool.uv.sources]
-hue-entertainment-pykit = { path = "../hue-entertainment-pykit", editable = true }
 
 [dependency-groups]
 dev = [

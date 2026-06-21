@@ -128,6 +128,10 @@ class HueController:
             f"area “{self.config.name}” • {len(self.channel_ids)} channel(s)"
         )
 
+    def stop(self) -> None:
+        """Release the active Hue Entertainment stream."""
+        self.streaming.stop_stream()
+
 
 class RecordingController:
     """Captures every controller call as `(t, snapshot)` where `snapshot` is

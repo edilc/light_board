@@ -2,7 +2,8 @@
 
 One source of truth for everything that should survive across runs:
 the day-target color, Spotify volume targets, internal audio volume,
-dark-mode preference, and the audio/Hue latency overrides.
+dark-mode preference, Home Assistant light targets, and the audio/Hue
+latency overrides.
 
 Stored at `data/preferences.json`. Load once at startup with
 `Config.load(path)`; mutate via `config.update(field=value, ...)` which
@@ -39,6 +40,11 @@ class Config:
     night_target_volume: int = 100
     internal_audio_volume: float = 1.0
     dark_mode: bool = False
+    home_assistant_url: str = "http://t460s:8123"
+    home_assistant_brighter_entity: str = "light.dining_room_brighter"
+    home_assistant_brighter_day_brightness_pct: int = 30
+    home_assistant_brighter_fade_seconds: float = 5.0
+    home_assistant_brighter_fade_decay_per_second: float = 0.7
     # Latency overrides are stored in milliseconds (matches JSON + UI);
     # use the `_s` properties for the seconds form.
     audio_latency_override_ms: float | None = None

@@ -13,6 +13,7 @@ from nicegui import app, background_tasks, ui
 
 import control
 import effects
+import home_assistant as ha_mod
 import spotify as spotify_mod
 from config import Config
 
@@ -128,8 +129,12 @@ class AppState:
     spotify: spotify_mod.SpotifyController = field(
         default_factory=spotify_mod.SpotifyController
     )
+    home_assistant: ha_mod.HomeAssistantClient = field(
+        default_factory=lambda: ha_mod.HomeAssistantClient.from_config(config)
+    )
     last_volume: int = 50
     volume_task: asyncio.Task | None = None
+    brighter_task: asyncio.Task | None = None
     # Manual color override (config panel)
     manual_override_active: bool = False
     # Cursor into logs/light_board.log for the live tail viewer
@@ -219,6 +224,14 @@ async def stop_effect() -> None:
             await vtask
         except (asyncio.CancelledError, Exception):
             pass
+    btask = state.brighter_task
+    state.brighter_task = None
+    if btask and not btask.done():
+        btask.cancel()
+        try:
+            await btask
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 @ui.page("/")
@@ -274,14 +287,101 @@ def home() -> None:
             good_victory_audio, evil_victory_audio,
         )
 
+        async def fade_brighter(kind: str, *, enabled: bool) -> None:
+            target = max(0, min(100, int(config.home_assistant_brighter_day_brightness_pct)))
+            duration = max(0.0, float(config.home_assistant_brighter_fade_seconds))
+            decay = max(0.01, min(0.99, float(config.home_assistant_brighter_fade_decay_per_second)))
+            interval = 0.1
+            steps = max(1, round(duration / interval))
+            try:
+                if enabled:
+                    await state.home_assistant.turn_on_light_async(
+                        config.home_assistant_brighter_entity,
+                        brightness_pct=1,
+                    )
+                for i in range(steps + 1):
+                    elapsed = min(duration, i * interval)
+                    if duration > 0:
+                        # Exponential approach-to-target: the remaining distance
+                        # shrinks by `decay` each second, normalized to land
+                        # exactly on the endpoint at `duration`.
+                        denom = 1.0 - (decay ** duration)
+                        progress = (1.0 - (decay ** elapsed)) / denom if denom else 1.0
+                    else:
+                        progress = 1.0
+                    if enabled:
+                        brightness = max(1, round(target * progress))
+                    else:
+                        brightness = max(1, round(target * (1.0 - progress)))
+                    if enabled or brightness > 1:
+                        await state.home_assistant.turn_on_light_async(
+                            config.home_assistant_brighter_entity,
+                            brightness_pct=brightness,
+                        )
+                    if i < steps:
+                        await asyncio.sleep(interval)
+                if enabled:
+                    await state.home_assistant.turn_on_light_async(
+                        config.home_assistant_brighter_entity,
+                        brightness_pct=target,
+                    )
+                else:
+                    await state.home_assistant.turn_off_light_async(
+                        config.home_assistant_brighter_entity
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[home-assistant] failed to fade Brighter for %s: %s",
+                    kind, exc,
+                    exc_info=True,
+                )
+                ui.notify(f"Home Assistant Brighter {kind} failed", type="negative")
+
+        def start_brighter_fade(kind: str, *, enabled: bool) -> None:
+            if state.brighter_task and not state.brighter_task.done():
+                state.brighter_task.cancel()
+            state.brighter_task = asyncio.create_task(fade_brighter(kind, enabled=enabled))
+            logger.info(
+                "[%s] Brighter fade started (%s over %.1fs)",
+                kind,
+                "on" if enabled else "off",
+                config.home_assistant_brighter_fade_seconds,
+            )
+
+        def pause_all_effect_audio() -> None:
+            for a in all_audio:
+                a.element.pause()
+                a.element.seek(0)
+
+        def start_volume_choreography(name: str, volume_choreography) -> None:
+            prev_vol = state.last_volume
+            state.volume_task = asyncio.create_task(
+                volume_choreography(state.spotify, prev_vol)
+            )
+            logger.info("[%s] volume choreography started (prev_vol=%d)", name, prev_vol)
+
+        async def run_day_state(
+            kind: str,
+            *,
+            audio_clip: AudioClip | None = None,
+            volume_choreography=None,
+        ) -> None:
+            logger.info("[%s] day state start", kind)
+            await stop_effect()
+            pause_all_effect_audio()
+            set_lights(0, 0, 0)
+            start_brighter_fade(kind, enabled=True)
+            if audio_clip is not None:
+                audio_clip.element.play()
+            if volume_choreography is not None:
+                start_volume_choreography(kind, volume_choreography)
+
         async def run_effect(coro_factory, audio_clip: AudioClip | None = None, volume_choreography=None) -> None:
             t_click = time.monotonic()
             name = coro_factory.__name__
             logger.info("[%s] run_effect start", name)
             await stop_effect()
-            for a in all_audio:
-                a.element.pause()
-                a.element.seek(0)
+            pause_all_effect_audio()
             if state.controller is None:
                 logger.info("[%s] aborting: no controller", name)
                 return
@@ -345,11 +445,7 @@ def home() -> None:
                 name, (time.monotonic() - t_click) * 1000,
             )
             if volume_choreography is not None:
-                prev_vol = state.last_volume
-                state.volume_task = asyncio.create_task(
-                    volume_choreography(state.spotify, prev_vol)
-                )
-                logger.info("[%s] volume choreography started (prev_vol=%d)", name, prev_vol)
+                start_volume_choreography(name, volume_choreography)
 
         async def on_lightning() -> None:
             await run_effect(effects.lightning_effect, thunder_audio, spotify_mod.lightning_volume)
@@ -361,25 +457,60 @@ def home() -> None:
             await run_effect(effects.gavel_effect, gavel_audio, spotify_mod.gavel_volume)
 
         async def on_rooster() -> None:
-            # Plays the rooster crow but uses the simple morning lerp animation.
-            await run_effect(
-                effects.morning_effect,
-                rooster_audio,
-                lambda s, p: spotify_mod.morning_volume(s, p, target=config.morning_target_volume),
+            await run_day_state(
+                "rooster",
+                audio_clip=rooster_audio,
+                volume_choreography=(
+                    lambda s, p: spotify_mod.morning_volume(
+                        s, p, target=config.morning_target_volume
+                    )
+                ),
             )
 
         async def on_morning() -> None:
-            await run_effect(
-                effects.morning_effect,
-                None,
-                lambda s, p: spotify_mod.morning_volume(s, p, target=config.morning_target_volume),
+            await run_day_state(
+                "morning",
+                audio_clip=rooster_audio,
+                volume_choreography=(
+                    lambda s, p: spotify_mod.morning_volume(
+                        s, p, target=config.morning_target_volume
+                    )
+                ),
             )
 
         async def on_night() -> None:
-            # Night drives its own volume internally so the fade is synced
-            # with the lights' settle into the candle state. No separate
-            # volume_choreography needed.
-            await run_effect(effects.night_effect, None, None)
+            logger.info("[night] start")
+            await stop_effect()
+            pause_all_effect_audio()
+            if state.brighter_task and not state.brighter_task.done():
+                state.brighter_task.cancel()
+                state.brighter_task = None
+            try:
+                await state.home_assistant.turn_off_light_async(
+                    config.home_assistant_brighter_entity
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[home-assistant] failed to turn Brighter off for night: %s",
+                    exc,
+                    exc_info=True,
+                )
+                ui.notify("Home Assistant Brighter night failed", type="negative")
+            if state.controller is None:
+                logger.info("[night] aborting Hektor flicker: no controller")
+                return
+            if state.manual_override_active:
+                logger.info("[night] aborting Hektor flicker: manual override active")
+                return
+            state.effect_task = asyncio.create_task(
+                effects.night_effect(
+                    state.controller,
+                    config,
+                    spotify=state.spotify,
+                    prev_volume=state.last_volume,
+                )
+            )
+            logger.info("[night] Hektor flicker task created")
 
         async def on_good_victory() -> None:
             await run_effect(effects.good_victory_effect, good_victory_audio, spotify_mod.good_victory_volume)
@@ -450,11 +581,11 @@ def home() -> None:
             "flat color=grey"
         ).classes("w-full text-xs")
 
-        effect_buttons = (
-            lightning_btn, gong_btn, gavel_btn, rooster_btn, morning_btn, night_btn,
-            good_victory_btn, evil_victory_btn,
+        hybrid_buttons = (rooster_btn, morning_btn, night_btn)
+        pykit_buttons = (
+            lightning_btn, gong_btn, gavel_btn, good_victory_btn, evil_victory_btn,
         )
-        for btn in effect_buttons:
+        for btn in (*hybrid_buttons, *pykit_buttons):
             btn.disable()
 
         # ╭─ Spotify widget — track + artist on own lines, wide slider ╮
@@ -1003,10 +1134,26 @@ def home() -> None:
 
     async def startup() -> None:
         await asyncio.to_thread(_ensure_click_wav)
+        await refresh_spotify()
+        logger.info(
+            "Spotify initial: track=%r artist=%r volume=%d",
+            track_label.text, artist_label.text, state.last_volume,
+        )
+        # Apply persisted internal-audio volume to the <audio> elements now
+        # that the page is fully connected (run_javascript needs a client).
+        _push_audio_vol(persist=False)
+        # Skip past existing log content so the viewer only shows new lines.
+        try:
+            state.log_offset = LOG_FILE.stat().st_size
+        except FileNotFoundError:
+            state.log_offset = 0
+        for btn in hybrid_buttons:
+            btn.enable()
+
         try:
             ctl = await asyncio.to_thread(control.connect)
         except Exception as exc:
-            status.text = f"Connect failed: {exc}"
+            status.text = f"Hue connect failed; day/night still available: {exc}"
             return
         state.controller = ctl
         # Update the channel toggle to match the actual channel count.
@@ -1030,21 +1177,8 @@ def home() -> None:
             max(0.0, state.audio_latency_s - HUE_LATENCY_S) * 1000,
             HUE_LATENCY_S * 1000,
         )
-        await refresh_spotify()
-        logger.info(
-            "Spotify initial: track=%r artist=%r volume=%d",
-            track_label.text, artist_label.text, state.last_volume,
-        )
-        # Apply persisted internal-audio volume to the <audio> elements now
-        # that the page is fully connected (run_javascript needs a client).
-        _push_audio_vol(persist=False)
-        # Skip past existing log content so the viewer only shows new lines.
-        try:
-            state.log_offset = LOG_FILE.stat().st_size
-        except FileNotFoundError:
-            state.log_offset = 0
         status.set_visibility(False)
-        for btn in effect_buttons:
+        for btn in pykit_buttons:
             btn.enable()
 
     ui.timer(0.1, startup, once=True)

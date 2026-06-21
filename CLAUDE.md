@@ -50,26 +50,25 @@ your head. Effects are pure choreography on top of these primitives.
     `VirtualClock` advances on `await sleep` so tests run in milliseconds
   - `connect()` — discovery → bridge → entertainment area → streaming.
     Blocking; called via `asyncio.to_thread`.
-- **`effects.py`** — Audio-synced effect coroutines:
+- **`effects.py`** — Hue Entertainment effect coroutines:
   - `lightning_effect` — strikes flash white over per-channel quivering
     blue/purple base, then settles to BRIGHT_WHITE
   - `gong_effect` — RMS-envelope-shaped gold pulse, 1.5s settle
   - `gavel_effect` — yellow then red flashes synced to onset times in
     `gavel.wav`, 1.5s settle
-  - `morning_effect` — 1s smoothstep crossfade from `ctl.last_colors` into
-    BRIGHT_WHITE
-  - `night_effect` — 4-phase persistent night state (1s dim → 2s 60%
-    blue/purple/orange + candle ramp → ∞ candle sustain). **Drives its own
-    Spotify volume fade internally** when given `spotify` + `prev_volume`,
-    synced with the lights' phase 1+2 transition.
+  - `morning_effect` is legacy/tested; `night_effect` is used by the UI for
+    Hektor's flickery night state.
 - **`spotify.py`** — macOS Spotify control via `osascript`.
   `SpotifyController` (best-effort: silently no-ops when Spotify is
   closed). Per-effect volume choreographies for lightning/gong/gavel/
-  morning that run as parallel asyncio tasks alongside the light coroutine
-  in `main.py`. (Night does its own volume internally — see above.)
+  morning/night that run as parallel asyncio tasks from `main.py`.
 - **`main.py`** — NiceGUI UI, page-load auto-connect, `run_effect`
   orchestration, audio playback, Spotify widget, the `HUE_LATENCY_S = 0.050`
-  constant for AV-sync compensation, calibration overlay.
+  constant for AV-sync compensation, calibration overlay. Rooster/Morning/
+  Night use Home Assistant only for `light.dining_room_brighter`; Hektor is
+  still controlled through Hue Entertainment. Daytime plays `sounds/rooster.wav`
+  and fades Brighter up over 5s with an exponential curve; Night turns Brighter
+  off immediately while starting Hektor's flickery night state.
 - **`tests/`** — `test_colors`, `test_signals`, `test_runner`,
   `test_config` for primitive unit tests; `test_effects` for trace-based
   effect tests using `VirtualClock` + `RecordingController`.
@@ -112,9 +111,10 @@ your head. Effects are pure choreography on top of these primitives.
   for 3.13 because `python-mbedtls` doesn't).
 - **Hue bridge credentials** live in `data/auth.json` (gitignored). On
   first connect, the library writes them after a button-press pairing.
-- **`hue-entertainment-pykit` is path-installed** from
-  `../hue-entertainment-pykit` (see `pyproject.toml [tool.uv.sources]`).
-  Editable install — local changes are picked up immediately.
+- **`hue-entertainment-pykit` is installed from PyPI** and pinned in
+  `pyproject.toml`; no sibling checkout is required.
+- **Home Assistant light control** uses `HA_TOKEN` from the environment and
+  defaults to `http://t460s:8123` with `light.dining_room_brighter`.
 - **Spotify control is optional and macOS-only**. Without Spotify running,
   the widget shows "Spotify: not detected" and volume choreographies
   silently no-op. AppleScript guards (`if application "Spotify" is running

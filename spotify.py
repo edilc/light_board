@@ -147,6 +147,13 @@ async def morning_volume(
     await _stepped_fade(spotify, prev_vol, target, duration=1.0, steps=10)
 
 
+async def night_volume(
+    spotify: SpotifyController, prev_vol: int, *, target: int = 100
+) -> None:
+    """Night setpoint: fade to `target`% over the old night light transition."""
+    await _stepped_fade(spotify, prev_vol, target, duration=3.0, steps=10)
+
+
 async def good_victory_volume(spotify: SpotifyController, prev_vol: int) -> None:
     """Duck to 20% across the whole victory clip (fireworks + trumpet),
     restore on completion. Same shape as `lightning_volume`."""
