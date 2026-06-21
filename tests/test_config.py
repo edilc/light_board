@@ -27,6 +27,7 @@ class TestLoad:
         path = tmp_path / "missing.json"
         c = Config.load(path)
         assert c.bright_white == (244, 218, 182)
+        assert c.home_assistant_brighter_day_brightness_pct == 20
         assert c.path == path
 
     def test_existing_file_overrides_defaults(self, tmp_path: Path):

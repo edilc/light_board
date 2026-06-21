@@ -135,6 +135,7 @@ class AppState:
     last_volume: int = 50
     volume_task: asyncio.Task | None = None
     brighter_task: asyncio.Task | None = None
+    lighting_mode: str = "day"
     # Manual color override (config panel)
     manual_override_active: bool = False
     # Cursor into logs/light_board.log for the live tail viewer
@@ -361,6 +362,22 @@ def home() -> None:
             )
             logger.info("[%s] volume choreography started (prev_vol=%d)", name, prev_vol)
 
+        def start_night_flicker(reason: str, *, drive_volume: bool) -> None:
+            if state.controller is None:
+                logger.info("[%s] aborting Hektor flicker: no controller", reason)
+                return
+            if state.manual_override_active:
+                logger.info("[%s] aborting Hektor flicker: manual override active", reason)
+                return
+            effect_kwargs: dict = {}
+            if drive_volume:
+                effect_kwargs["spotify"] = state.spotify
+                effect_kwargs["prev_volume"] = state.last_volume
+            state.effect_task = asyncio.create_task(
+                effects.night_effect(state.controller, config, **effect_kwargs)
+            )
+            logger.info("[%s] Hektor night flicker task created", reason)
+
         async def run_day_state(
             kind: str,
             *,
@@ -368,6 +385,7 @@ def home() -> None:
             volume_choreography=None,
         ) -> None:
             logger.info("[%s] day state start", kind)
+            state.lighting_mode = "day"
             await stop_effect()
             pause_all_effect_audio()
             set_lights(0, 0, 0)
@@ -438,9 +456,25 @@ def home() -> None:
                     "[%s] driving volume internally (prev_vol=%d → target)",
                     name, state.last_volume,
                 )
-            state.effect_task = asyncio.create_task(
-                coro_factory(state.controller, config, **effect_kwargs)
-            )
+            async def effect_runner() -> None:
+                task = asyncio.current_task()
+                completed = False
+                try:
+                    await coro_factory(state.controller, config, **effect_kwargs)
+                    completed = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("[%s] light task failed: %s", name, exc, exc_info=True)
+                    ui.notify(f"{name} failed", type="negative")
+                finally:
+                    if state.effect_task is task:
+                        state.effect_task = None
+                    if completed and state.lighting_mode == "night":
+                        logger.info("[%s] restoring Hektor night flicker", name)
+                        start_night_flicker(f"{name}-restore", drive_volume=False)
+
+            state.effect_task = asyncio.create_task(effect_runner())
             logger.info(
                 "[%s] light task created at +%.0fms after click",
                 name, (time.monotonic() - t_click) * 1000,
@@ -481,6 +515,7 @@ def home() -> None:
 
         async def on_night() -> None:
             logger.info("[night] start")
+            state.lighting_mode = "night"
             await stop_effect()
             pause_all_effect_audio()
             if state.brighter_task and not state.brighter_task.done():
@@ -497,21 +532,7 @@ def home() -> None:
                     exc_info=True,
                 )
                 ui.notify("Home Assistant Brighter night failed", type="negative")
-            if state.controller is None:
-                logger.info("[night] aborting Hektor flicker: no controller")
-                return
-            if state.manual_override_active:
-                logger.info("[night] aborting Hektor flicker: manual override active")
-                return
-            state.effect_task = asyncio.create_task(
-                effects.night_effect(
-                    state.controller,
-                    config,
-                    spotify=state.spotify,
-                    prev_volume=state.last_volume,
-                )
-            )
-            logger.info("[night] Hektor flicker task created")
+            start_night_flicker("night", drive_volume=True)
 
         async def on_good_victory() -> None:
             await run_effect(effects.good_victory_effect, good_victory_audio, spotify_mod.good_victory_volume)
@@ -520,6 +541,7 @@ def home() -> None:
             await run_effect(effects.evil_victory_effect, evil_victory_audio, spotify_mod.evil_victory_volume)
 
         async def on_stop() -> None:
+            state.lighting_mode = "off"
             await stop_effect()
             for a in all_audio:
                 a.element.pause()

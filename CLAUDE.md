@@ -68,7 +68,9 @@ your head. Effects are pure choreography on top of these primitives.
   Night use Home Assistant only for `light.dining_room_brighter`; Hektor is
   still controlled through Hue Entertainment. Daytime plays `sounds/rooster.wav`
   and fades Brighter up over 5s with an exponential curve; Night turns Brighter
-  off immediately while starting Hektor's flickery night state.
+  off immediately while starting Hektor's flickery night state. Timed Hue
+  effects preserve the current day/night mode; if one finishes during Night,
+  Hektor returns to the night flicker instead of settling to day white.
 - **`tests/`** — `test_colors`, `test_signals`, `test_runner`,
   `test_config` for primitive unit tests; `test_effects` for trace-based
   effect tests using `VirtualClock` + `RecordingController`.

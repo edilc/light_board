@@ -42,7 +42,7 @@ class Config:
     dark_mode: bool = False
     home_assistant_url: str = "http://t460s:8123"
     home_assistant_brighter_entity: str = "light.dining_room_brighter"
-    home_assistant_brighter_day_brightness_pct: int = 30
+    home_assistant_brighter_day_brightness_pct: int = 20
     home_assistant_brighter_fade_seconds: float = 5.0
     home_assistant_brighter_fade_decay_per_second: float = 0.7
     # Latency overrides are stored in milliseconds (matches JSON + UI);
